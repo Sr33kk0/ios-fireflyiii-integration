@@ -328,11 +328,16 @@ class Bot(discord.Client):
     async def sweep(self):
         """Catch Apple Pay transactions that arrived while this service was down."""
         since = (date.today() - timedelta(days=7)).isoformat()
-        try:
-            groups = await self.ff_all("/search/transactions",
-                                       {"query": f"tag_is:{TAG} has_no_category:true date_after:{since}"})
-        except Exception:
-            return log.exception("startup sweep failed")
+        for _ in range(20):  # after a reboot Firefly may still be migrating; give it ~5 min
+            try:
+                groups = await self.ff_all("/search/transactions",
+                                           {"query": f"tag_is:{TAG} has_no_category:true date_after:{since}"})
+                break
+            except Exception as e:
+                log.warning("startup sweep: Firefly not ready (%s), retrying in 15s", e)
+                await asyncio.sleep(15)
+        else:
+            return log.error("startup sweep gave up")
         log.info("startup sweep: %d unprocessed", len(groups))
         for g in groups:
             txs = g["attributes"]["transactions"]
