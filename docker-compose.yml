@@ -75,6 +75,18 @@ services:
       - firefly_iii
     depends_on:
       - app
+
+  # Apple Pay enrichment: Firefly webhook -> Ollama -> Firefly, review on Discord. See ai/README.md
+  ai:
+    build: ./ai
+    hostname: ai
+    container_name: firefly_iii_ai
+    restart: always
+    networks:
+      - firefly_iii
+    env_file: .ai.env
+    depends_on:
+      - app
 volumes:
    firefly_iii_upload:
    firefly_iii_db:

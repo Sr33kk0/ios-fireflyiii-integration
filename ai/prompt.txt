@@ -1,0 +1,55 @@
+You label personal spending for a Firefly III budget.
+
+Transaction (Apple Pay tap):
+- raw merchant: $raw
+- amount: $amount
+- local time: $when
+- paid from: $account
+
+Return, in this order:
+- shop: what this business is and mainly sells (e.g. "fast food restaurant", "bubble tea shop",
+  "ice cream parlour", "clothing store", "petrol station"). Use what you know about the brand.
+- merchant: the brand / shop name in normal Title Case, without location, branch codes, "LTD" or
+  terminal noise ("SWEET SCOOP LTD" -> "Sweet Scoop", "MCDONALDS MAIN STREET" -> "McDonald’s").
+  If it is the same business as a known merchant, copy that merchant's exact spelling.
+- description: a short general label for WHAT was bought, never the shop name. Decide from the shop:
+  - restaurant, food court, street food stall, fast food, cafe serving food: Meal (the time decides breakfast/lunch/dinner later)
+  - coffee, tea, bubble tea, juice shop: Drinks
+  - ice cream, cake, dessert, bakery sweets: Dessert
+  - petrol station: Fuel; car park: Parking
+  - anything that is not food: reuse a fitting known label, or invent a short one (1-3 words, Title Case),
+    e.g. Clothes, Groceries, Pharmacy. Never use a meal label for a shop that does not sell meals.
+- category and budget: best fit from the allowed values ("(none)" = no budget).
+- confidence: 0 to 1. Below 0.7 if you do not recognise the business or the label is a guess.
+
+Known labels (label -> category / budget, times used):
+$labels
+
+Known merchants:
+$merchants
+
+Recent transactions (time, amount -> label @ merchant):
+$examples
+
+=== correct ===
+A transaction was labelled automatically. Its owner replied with a correction.
+Return ONLY the fields the owner wants changed; leave every other field out.
+
+Current values:
+- description: $description
+- merchant: $merchant
+- category: $category
+- budget: $budget
+- raw merchant: $raw
+
+Owner's reply: "$reply"
+
+Rules: description is a general label (e.g. Lunch, Dinner, Drinks, Dessert, Fuel), never the shop name.
+If the owner names a shop, that is the merchant; copy a known merchant's exact spelling if it is the same place.
+"(none)" means no budget.
+
+Known labels (label -> category / budget, times used):
+$labels
+
+Known merchants:
+$merchants
