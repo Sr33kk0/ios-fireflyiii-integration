@@ -90,6 +90,11 @@ def test_finalize():
     assert f == {"description": "Dessert", "destination_name": "Sweet Scoop", "category_name": "Food", "budget_name": None}
     assert reasons == ["new merchant", "new label", "low confidence"]
 
+    # expense account exists but has no history (e.g. its transactions were deleted): still flagged
+    c["merchants"].append("Sweet Scoop")
+    f, reasons = bot.finalize(result("Drinks", "sweet scoop"), c, 15)
+    assert (f["destination_name"], reasons) == ("Sweet Scoop", ["new merchant", "new label"])
+
     try:
         bot.finalize(result(" ", "X"), c, 12)
         assert False, "empty description must raise"

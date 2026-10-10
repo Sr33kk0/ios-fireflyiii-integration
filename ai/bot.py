@@ -109,6 +109,7 @@ def build_context(merchants, categories, budgets, splits):
         "label_map": {label: c.most_common(1)[0][0] for label, c in combos.items()},
         "counts": {label: sum(c.values()) for label, c in combos.items()},
         "merchant_kind": merchant_kind,
+        "seen": set(by_merchant),  # merchants with withdrawal history
         "examples": examples,
     }
 
@@ -125,9 +126,8 @@ def finalize(result, ctx, hour):
     if not result["description"].strip() or not result["merchant"].strip():
         raise ValueError(f"empty description or merchant: {result}")
     reasons = []
-    merchant = match_name(result["merchant"], ctx["merchants"])
-    if not merchant:
-        merchant = result["merchant"].strip()
+    merchant = match_name(result["merchant"], ctx["merchants"]) or result["merchant"].strip()
+    if merchant not in ctx["seen"]:  # also an existing expense account with no history: nothing to check against
         reasons.append("new merchant")
     desc = kind(ctx["merchant_kind"].get(merchant) or result["description"].strip())
     if desc == "Meal":
