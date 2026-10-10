@@ -76,7 +76,7 @@ services:
     depends_on:
       - app
 
-  # Apple Pay enrichment: Firefly webhook -> Ollama -> Firefly, review on Discord. See ai/README.md
+  # Apple Pay enrichment: Firefly webhook -> Ollama -> Firefly, review on Discord. See README.md
   ai:
     build: ./ai
     hostname: ai

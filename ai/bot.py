@@ -1,7 +1,7 @@
 """Enrich Apple Pay transactions in Firefly III with a local Ollama model; review flags on Discord.
 
 Firefly webhook (STORE_TRANSACTION) -> classify with Ollama -> PUT back to Firefly -> ping Discord if unsure.
-Replying to a ping corrects the transaction. See docs/superpowers/specs/2026-10-10-applepay-firefly-ai-design.md.
+Replying to a ping corrects the transaction. See README.md.
 """
 import asyncio
 import hashlib
