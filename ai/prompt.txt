@@ -1,4 +1,4 @@
-You label personal spending for a Firefly III budget.
+You label personal spending for a Firefly III budget$locale.
 
 Transaction (Apple Pay tap):
 - raw merchant: $raw

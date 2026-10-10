@@ -76,6 +76,7 @@ FIREFLY_PUBLIC_URL=http://localhost               # Firefly as seen from your br
 OLLAMA_URL=http://host.docker.internal:11434
 OLLAMA_MODEL=qwen3:8b
 CONFIDENCE_MIN=0.7                                # below this the transaction is flagged for review
+LOCALE=                                           # where you spend, e.g. Germany (currency EUR)
 ```
 
 On Linux, `host.docker.internal` is not defined by default. Set `OLLAMA_URL` to your host's address, or add
@@ -166,8 +167,10 @@ Reply `dessert` and the message flips to ✅ fixed.
 
 ## Customising
 
-- **Prompt:** `ai/prompt.txt` uses generic examples. Change the examples and label
-  rules to match your spending.
+- **Locale:** set `LOCALE` in `.ai.env` so the model knows your country and currency and recognises
+  local brands.
+- **Prompt:** `ai/prompt.txt` uses generic examples. Change the examples and label rules to match your
+  spending.
 - **Meal times:** Breakfast 05–11, Lunch 11–17, Dinner otherwise. Change `meal_for` in `ai/bot.py`.
 - **Model and threshold:** `OLLAMA_MODEL` and `CONFIDENCE_MIN` in `.ai.env`.
 

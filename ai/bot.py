@@ -28,6 +28,7 @@ WEBHOOK_SECRET = env("WEBHOOK_SECRET", "")
 OLLAMA_URL = env("OLLAMA_URL", "http://host.docker.internal:11434")
 OLLAMA_MODEL = env("OLLAMA_MODEL", "qwen3:8b")
 CONFIDENCE_MIN = float(env("CONFIDENCE_MIN", "0.7"))
+LOCALE = env("LOCALE", "")  # e.g. "Germany (currency EUR)": helps the model place local brands
 DISCORD_TOKEN = env("DISCORD_TOKEN", "")
 DISCORD_CHANNEL_ID = int(env("DISCORD_CHANNEL_ID") or 0)
 DISCORD_USER_ID = int(env("DISCORD_USER_ID") or 0)
@@ -186,6 +187,7 @@ def labels_text(ctx):
 
 def classify_prompt(tx, raw, ctx):
     return Template(CLASSIFY).safe_substitute(
+        locale=f" in {LOCALE}" if LOCALE else "",
         raw=raw, amount=money(tx), when=when(tx, "%A %H:%M"), account=tx["source_name"],
         labels=labels_text(ctx), merchants=", ".join(sorted(ctx["merchants"])),
         examples="\n".join(ctx["examples"]) or "(none yet)")
