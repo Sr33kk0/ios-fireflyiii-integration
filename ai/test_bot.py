@@ -33,6 +33,9 @@ def test_match_name():
 def test_parse_raw():
     assert bot.parse_raw(tx("X", notes="raw: MCD MAIN ST 0423 | card: My Visa")) == "MCD MAIN ST 0423"
     assert bot.parse_raw(tx("SHELL 24")) == "SHELL 24"
+    # real eWallet note: Shortcuts put two spaces after "raw:" and none before "|"
+    assert bot.parse_raw(tx("X", notes="raw:  A has transferred $0.01 to you.| card: My eWallet")) == \
+        "A has transferred $0.01 to you."
 
 
 def ctx():
@@ -127,11 +130,26 @@ def test_summary_roundtrip():
     assert bot.txn_id("no link here") is None
 
 
+def test_income_labels():
+    splits = [tx("Allowance", "Family"), tx("Allowance", "Family"), tx("Allowance", "Gifts"), tx("Refund", "Food")]
+    assert bot.income_labels(splits) == {"Allowance": "Family", "Refund": "Food"}
+
+
+def test_split_reply():
+    assert bot.split_reply(" Allowance from Parents / Family ") == ("Allowance from Parents", "Family")
+    assert bot.split_reply("Allowance from Parents") == ("Allowance from Parents", None)
+    assert bot.split_reply("Bank/eWallet top up / Banking") == ("Bank/eWallet top up", "Banking")  # last slash splits
+    assert bot.split_reply("Refund /") == ("Refund /", None)  # nothing after the slash: all name
+    assert bot.split_reply("x / (none)") == ("x", "(none)")
+
+
 def test_prompts_fill():
     c = ctx()
     t = tx("SUBWAY 01", notes="raw: SUBWAY 01 | card: My Visa")
     assert not re.search(r"\$\w", bot.classify_prompt(t, "SUBWAY 01", c))
     assert not re.search(r"\$\w", bot.correct_prompt(t, "SUBWAY 01", "dinner", c))
+    p = bot.income_prompt(t, "Allowance", {"Refund": "Food"})
+    assert not re.search(r"\$\w", p) and "- Refund -> Food" in p and "=== " not in bot.CORRECT
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 """Enrich Apple Pay transactions in Firefly III with a local Ollama model; review flags on Discord.
 
 Firefly webhook (STORE_TRANSACTION) -> classify with Ollama -> PUT back to Firefly -> ping Discord if unsure.
-Replying to a ping corrects the transaction. See README.md.
+Replying to a ping corrects the transaction. Transactions tagged `ask` are pinged as-is: the reply becomes
+the description and the model picks only the category. See README.md.
 """
 import asyncio
 import hashlib
@@ -35,9 +36,10 @@ DISCORD_USER_ID = int(env("DISCORD_USER_ID") or 0)
 
 TAG = "applepay"
 PENDING = "Apple Pay pending"  # placeholder expense account the Shortcut books to
+ASK = "ask"  # tag: ping on Discord, the reply is the description (e.g. eWallet money received)
 NO_BUDGET = "(none)"
 CACHE_SECONDS = 3600
-CLASSIFY, CORRECT = Path(__file__).with_name("prompt.txt").read_text(encoding="utf-8").split("\n=== correct ===\n")
+CLASSIFY, CORRECT, INCOME = re.split(r"\n=== \w+ ===\n", Path(__file__).with_name("prompt.txt").read_text(encoding="utf-8"))
 log = logging.getLogger("ai")
 
 
@@ -63,7 +65,7 @@ def match_name(name, names):
 
 
 def parse_raw(tx):
-    m = re.search(r"raw: (.*?) \| card: ", tx.get("notes") or "")
+    m = re.search(r"raw:\s*(.*?)\s*\|\s*card:", tx.get("notes") or "")  # Shortcuts pads variables unevenly
     return m.group(1) if m else tx["description"]
 
 
@@ -113,6 +115,20 @@ def build_context(merchants, categories, budgets, splits):
         "seen": set(by_merchant),  # merchants with withdrawal history
         "examples": examples,
     }
+
+
+def income_labels(splits):
+    """Past named `ask` transactions -> {name: most common category}."""
+    combos = defaultdict(Counter)
+    for t in splits:
+        combos[t["description"]][t.get("category_name")] += 1
+    return {name: c.most_common(1)[0][0] for name, c in combos.items()}
+
+
+def split_reply(reply):
+    """`name / category` -> (name, category); a plain `name` -> (name, None). Splits on the last slash."""
+    name, sep, category = reply.rpartition("/")
+    return (name.strip(), category.strip()) if sep and name.strip() and category.strip() else (reply.strip(), None)
 
 
 def fields(description, merchant, category, budget):
@@ -198,6 +214,12 @@ def correct_prompt(tx, raw, reply, ctx):
         description=tx["description"], merchant=tx["destination_name"], category=tx.get("category_name") or "-",
         budget=tx.get("budget_name") or NO_BUDGET, raw=raw, reply=reply,
         labels=labels_text(ctx), merchants=", ".join(sorted(ctx["merchants"])))
+
+
+def income_prompt(tx, name, labels):
+    return Template(INCOME).safe_substitute(
+        locale=f" in {LOCALE}" if LOCALE else "", name=name, payer=tx["source_name"], amount=money(tx),
+        raw=parse_raw(tx), labels="\n".join(f"- {n} -> {c}" for n, c in labels.items()) or "(none yet)")
 
 
 def schema(ctx, correction=False):
@@ -302,8 +324,12 @@ class Bot(discord.Client):
         group = json.loads(body)["content"]
         txs = group["transactions"]
         # single split only: a PUT with one split would drop the others
-        if len(txs) == 1 and TAG in (txs[0].get("tags") or []):
+        tags = (txs[0].get("tags") or []) if len(txs) == 1 else []
+        if TAG in tags:
             self.spawn(self.enrich(group["id"], txs[0]))
+        elif ASK in tags:
+            self.spawn(self.post(f"<@{DISCORD_USER_ID}> ✏️ reply with a name, or name / category\n"
+                                 + summary(group["id"], txs[0], None, parse_raw(txs[0]))))
         return web.Response(text="ok")  # answer now; Firefly gives up after 10s
 
     async def enrich(self, group_id, tx):
@@ -346,6 +372,23 @@ class Bot(discord.Client):
             if len(txs) == 1:
                 await self.enrich(int(g["id"]), txs[0])
 
+    async def named(self, tx, reply):
+        """`ask` reply -> description; category as typed (`name / category`), else from a past use of the
+        same name, else the model."""
+        name, category = split_reply(reply)
+        groups = await self.ff_all("/search/transactions", {"query": f"tag_is:{ASK} has_any_category:true"})
+        labels = income_labels([t for g in groups for t in g["attributes"]["transactions"]])
+        known = match_name(name, labels)
+        if category:  # the owner's word beats history; a new name becomes a new Firefly category
+            category = match_name(category, (await self.context())["categories"]) or category
+            return {"description": known or name, "category_name": None if norm(category) == NO_BUDGET else category}
+        if known:  # history beats the model
+            return {"description": known, "category_name": labels[known]}
+        categories = (await self.context())["categories"] + [NO_BUDGET]  # "(none)": better blank than wrong
+        result = await self.ollama(income_prompt(tx, name, labels), {
+            "type": "object", "properties": {"category": {"type": "string", "enum": categories}}, "required": ["category"]})
+        return {"description": name, "category_name": None if result["category"] == NO_BUDGET else result["category"]}
+
     async def on_message(self, msg):
         ref = msg.reference
         if msg.author.id != DISCORD_USER_ID or msg.channel.id != DISCORD_CHANNEL_ID or not ref or not ref.message_id:
@@ -356,6 +399,13 @@ class Bot(discord.Client):
             return
         try:
             tx = (await self.ff("GET", f"/transactions/{group_id}"))["data"]["attributes"]["transactions"][0]
+            if ASK in (tx.get("tags") or []):
+                f = await self.named(tx, msg.content.strip())
+                await self.update(group_id, tx["transaction_journal_id"], f)
+                await target.edit(content=f"✅ {f['description']} ({f['category_name'] or '-'})\n"
+                                          + summary(group_id, tx, None, parse_raw(tx)))
+                await msg.add_reaction("✅")
+                return log.info("#%s named by reply %r -> %s", group_id, msg.content, f)
             raw, ctx = parse_raw(tx), await self.context()
             patch = await self.ollama(correct_prompt(tx, raw, msg.content, ctx), schema(ctx, correction=True))
             f = apply_correction(tx, patch, ctx)

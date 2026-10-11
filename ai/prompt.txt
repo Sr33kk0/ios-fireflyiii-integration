@@ -53,3 +53,16 @@ $labels
 
 Known merchants:
 $merchants
+
+=== income ===
+You categorise money received for a Firefly III budget$locale. The owner has named it.
+
+- name: $name
+- from: $payer
+- amount: $amount
+- notification: $raw
+
+Pick the best fitting category from the allowed values, or "(none)" if none really fits money received.
+
+Money received before (name -> category):
+$labels

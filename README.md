@@ -150,6 +150,39 @@ then **New Blank Automation** with these actions:
 name. Keep the `applepay` tag, the `Apple Pay pending` destination and the `raw: … | card: …` notes format:
 the service relies on all three.
 
+### 5. Money received (optional)
+
+For eWallet or bank notifications such as "You've received money!" (iOS 27 or later): the
+service pings you on Discord, your reply becomes the description, and the model picks the category (a name
+you have used before keeps its category). The model picks only from existing categories and leaves it blank
+when none fits. Reply `name / category` to set the category yourself: `Allowance from Parents / Allowance`
+creates the category if it is new, and that name keeps it from then on. `/ (none)` leaves it blank.
+
+**Automation → + → Notification**, pick the app, filter *Title contains* `received money`, **Run Immediately**:
+
+1. **Match Text** in *Shortcut Input → Message*, regex `\$\s?([\d,]+\.\d{2})`, then **Get Group at Index** 1,
+   then **Replace Text** `,` → nothing, then **Set Variable** `Amount`.
+2. **Match Text** in *Message*, regex `^(.+?) has transferred`, then **Get Group at Index** 1, then
+   **Set Variable** `Payer`.
+3. **Format Date** as in step 4 above.
+4. **Text**:
+
+   ```json
+   {"error_if_duplicate_hash": false, "apply_rules": true, "transactions": [{
+     "type": "deposit", "date": "[Formatted Date]", "amount": "[Amount]",
+     "description": "[Payer]", "source_name": "[Payer]", "destination_name": "My eWallet",
+     "tags": ["ask"], "notes": "raw: [Message] | card: My eWallet"}]}
+   ```
+
+5. **Get Contents of URL** as in step 4 above.
+
+The regexes expect a message like `Alex has transferred $5.00 to you.` For wording like `You've received $5.00
+from NAME on …`, use the payer regex `from (.+?) on \d`. Swap `\$` for your currency symbol or code, match the
+title filter to your app's, and check its notification text before reusing them.
+
+Money you move between your own accounts would count as income: per wallet, add a Firefly rule *source account
+is \<your name\>* and *destination account is \<wallet\>* → *convert to transfer* with the sending account.
+
 ## Try it without a tap
 
 ```sh
