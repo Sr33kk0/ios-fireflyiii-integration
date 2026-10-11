@@ -6,15 +6,7 @@ taps with a **local** LLM ([Ollama](https://ollama.com/)) and asks you on Discor
 Tap your phone at a shop, and a few seconds later Firefly holds a clean transaction: `Lunch @ McDonald's`,
 with category and budget set, where the bank only gave you `MCDONALDS MAIN STREET 0423`.
 
-```mermaid
-flowchart LR
-    A[Apple Pay tap] -->|iOS Shortcut| B[Firefly III]
-    B -->|webhook| C[ai service]
-    C <-->|classify| D[Ollama]
-    C -->|update transaction| B
-    C -.->|unsure or new| E[Discord ping]
-    E -.->|your reply| C
-```
+![An Apple Pay tap goes through an iOS Shortcut to Firefly III, whose webhook sends it to the AI service. The service classifies it with Ollama and updates the transaction, and pings Discord when unsure so your reply can correct it.](assets/flow.png)
 
 ## Features
 
@@ -47,6 +39,7 @@ flowchart LR
 | `ai/bot.py` | Webhook receiver, Ollama classifier, Discord bot |
 | `ai/prompt.txt` | Classification and correction prompts (edit to fit your spending) |
 | `ai/test_bot.py` | Plain-assert checks for the pure logic |
+| `assets/flow.html` | Source of the flow diagram above (`assets/flow.png` is its export) |
 
 ## Setup
 
