@@ -220,3 +220,10 @@ docker compose run --rm --no-deps ai python test_bot.py
 - Only in-store taps trigger the iOS Transaction automation. Online and in-app Apple Pay payments usually don't.
 - Split transactions are skipped, since updating one split would drop the others.
 - Discord sees a short summary of each flagged transaction: amount, time, account, label and raw merchant.
+
+## License
+
+[Apache License 2.0](LICENSE), except `docker-compose.yml`, which is adapted from
+[firefly-iii/docker](https://github.com/firefly-iii/docker) and remains under
+[AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html). Firefly III and its data importer are separate
+AGPL-3.0 projects, pulled as unmodified images.
