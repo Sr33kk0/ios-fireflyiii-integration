@@ -70,6 +70,7 @@ OLLAMA_URL=http://host.docker.internal:11434
 OLLAMA_MODEL=qwen3:8b
 CONFIDENCE_MIN=0.7                                # below this the transaction is flagged for review
 LOCALE=                                           # where you spend, e.g. Germany (currency EUR)
+OWNER_NAME=                                       # your name as banks print it, for own transfers (step 5)
 ```
 
 On Linux, `host.docker.internal` is not defined by default. Set `OLLAMA_URL` to your host's address, or add
@@ -173,8 +174,10 @@ The regexes expect a message like `Alex has transferred $5.00 to you.` For wordi
 from NAME on …`, use the payer regex `from (.+?) on \d`. Swap `\$` for your currency symbol or code, match the
 title filter to your app's, and check its notification text before reusing them.
 
-Money you move between your own accounts would count as income: per wallet, add a Firefly rule *source account
-is \<your name\>* and *destination account is \<wallet\>* → *convert to transfer* with the sending account.
+Money you move between your own accounts shows up twice: sent from one account (step 6) and received in
+another. Set `OWNER_NAME` to your name as the notifications print it, and the service merges the two halves
+(same amount, within 15 minutes) into one Firefly transfer, in any direction between any of your accounts. A
+half whose other half never arrives is pinged after 10 minutes.
 
 ### 6. Money sent (optional)
 

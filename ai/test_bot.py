@@ -142,6 +142,23 @@ def test_named_labels():
     assert bot.named_labels(splits, "withdrawal") == {"Dinner split": "Food"}
 
 
+def test_own_partner():
+    bot.OWNER_NAME = "HO SHOU YEE"
+    sent = tx("HO SHOU YEE", dest="HO SHOU YEE", tags=["ask"], amount="0.020000000000", date="2026-10-11T14:07:30+08:00")
+    got = lambda **kw: {**tx("HO SHOU YEE", dest="Ryt Bank", tags=["ask"], amount="0.02", type="deposit",
+                            date="2026-10-11T14:08:00+08:00"), "source_name": "HO SHOU YEE", **kw}
+    assert bot.is_own(sent) and bot.is_own(got()) and not bot.is_own(tx("X", dest="ONG CHUN HAO", tags=["ask"]))
+    assert bot.own_partner(sent, {5: got()}) == (5, got())
+    assert bot.own_partner(got(), {4: sent}) == (4, sent)  # either half finds the other
+    assert bot.own_partner(sent, {5: got(amount="0.03")}) is None
+    assert bot.own_partner(sent, {5: got(date="2026-10-11T15:07:30+08:00")}) is None  # an hour apart
+    assert bot.own_partner(sent, {5: got(source_name="ONG CHUN HAO")}) is None  # money from someone else
+    assert bot.own_partner(sent, {5: got(tags=[])}) is None
+    assert bot.own_partner(sent, {6: got(date="2026-10-11T14:15:00+08:00"), 5: got()})[0] == 5  # closest wins
+    bot.OWNER_NAME = ""
+    assert not bot.is_own(sent)  # unset: no pairing
+
+
 def test_split_reply():
     assert bot.split_reply(" Allowance from Parents / Family ") == ("Allowance from Parents", "Family")
     assert bot.split_reply("Allowance from Parents") == ("Allowance from Parents", None)
