@@ -54,15 +54,15 @@ $labels
 Known merchants:
 $merchants
 
-=== income ===
-You categorise money received for a Firefly III budget$locale. The owner has named it.
+=== named ===
+You categorise money $direction for a Firefly III budget$locale. The owner has named it.
 
 - name: $name
-- from: $payer
+- $party
 - amount: $amount
 - notification: $raw
 
-Pick the best fitting category from the allowed values, or "(none)" if none really fits money received.
+Pick the best fitting category from the allowed values, or "(none)" if none really fits money $direction.
 
-Money received before (name -> category):
+Money $direction before (name -> category):
 $labels

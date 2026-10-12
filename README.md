@@ -176,6 +176,22 @@ title filter to your app's, and check its notification text before reusing them.
 Money you move between your own accounts would count as income: per wallet, add a Firefly rule *source account
 is \<your name\>* and *destination account is \<wallet\>* → *convert to transfer* with the sending account.
 
+### 6. Money sent (optional)
+
+The same flow for notifications such as "Transfer settled!": filter on that title and post a `withdrawal`
+from your account to the person you paid. Reply to the ping the same way. Money you sent and money you
+received keep separate name → category histories.
+
+```json
+{"error_if_duplicate_hash": false, "apply_rules": true, "transactions": [{
+  "type": "withdrawal", "date": "[Formatted Date]", "amount": "[Amount]",
+  "description": "[Payee]", "source_name": "My Bank", "destination_name": "[Payee]",
+  "tags": ["ask"], "notes": "raw: [Message] | card: My Bank"}]}
+```
+
+For `You've sent $5.00 to NAME on …`, the payee regex is `to (.+?) on \d`. Test with a real notification:
+tapping ▶ in the editor runs the automation without one, so both Match actions come back empty.
+
 ## Try it without a tap
 
 ```sh

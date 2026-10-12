@@ -6,10 +6,11 @@ import re
 import bot
 
 
-def tx(desc, cat=None, bud=None, dest="Shop", tags=(), notes=None, date="2026-10-10T13:10:00+00:00", amount="12.500000000000"):
+def tx(desc, cat=None, bud=None, dest="Shop", tags=(), notes=None, date="2026-10-10T13:10:00+00:00", amount="12.500000000000",
+       type="withdrawal"):
     return {"description": desc, "category_name": cat, "budget_name": bud, "destination_name": dest,
             "source_name": "Main Account", "tags": list(tags), "notes": notes, "date": date, "amount": amount,
-            "currency_symbol": "€", "transaction_journal_id": "7"}
+            "currency_symbol": "€", "transaction_journal_id": "7", "type": type}
 
 
 def test_signature():
@@ -48,6 +49,9 @@ def ctx():
         # not yet enriched: raw merchant as description, must not become a label or example
         tx("DOWNTOWN BURGER BAR", tags=["applepay"], notes="raw: DOWNTOWN BURGER BAR | card: My Visa",
            date="2026-10-10T20:00:00+00:00"),
+        # money sent to a person, waiting for a name / already named: its own flow, not Apple Pay history
+        tx("ONG CHUN HAO", dest="ONG CHUN HAO", tags=["ask"], date="2026-10-10T21:00:00+00:00"),
+        tx("Dinner split", "Food", dest="ONG CHUN HAO", tags=["ask"], date="2026-10-10T22:00:00+00:00"),
     ]
     return bot.build_context(["McDonald’s", "Subway", "Shell", bot.PENDING], ["Food", "Transport"], ["Food", "Transport"], splits)
 
@@ -130,9 +134,12 @@ def test_summary_roundtrip():
     assert bot.txn_id("no link here") is None
 
 
-def test_income_labels():
-    splits = [tx("Allowance", "Family"), tx("Allowance", "Family"), tx("Allowance", "Gifts"), tx("Refund", "Food")]
-    assert bot.income_labels(splits) == {"Allowance": "Family", "Refund": "Food"}
+def test_named_labels():
+    splits = [tx("Allowance", "Family", type="deposit"), tx("Allowance", "Family", type="deposit"),
+              tx("Allowance", "Gifts", type="deposit"), tx("Refund", "Food", type="deposit"),
+              tx("Dinner split", "Food")]  # money sent keeps its own history
+    assert bot.named_labels(splits, "deposit") == {"Allowance": "Family", "Refund": "Food"}
+    assert bot.named_labels(splits, "withdrawal") == {"Dinner split": "Food"}
 
 
 def test_split_reply():
@@ -148,8 +155,11 @@ def test_prompts_fill():
     t = tx("SUBWAY 01", notes="raw: SUBWAY 01 | card: My Visa")
     assert not re.search(r"\$\w", bot.classify_prompt(t, "SUBWAY 01", c))
     assert not re.search(r"\$\w", bot.correct_prompt(t, "SUBWAY 01", "dinner", c))
-    p = bot.income_prompt(t, "Allowance", {"Refund": "Food"})
+    p = bot.named_prompt(tx("X", dest="My eWallet", type="deposit"), "Allowance", {"Refund": "Food"})
     assert not re.search(r"\$\w", p) and "- Refund -> Food" in p and "=== " not in bot.CORRECT
+    assert "money received" in p and "from: Main Account" in p
+    p = bot.named_prompt(tx("X", dest="ONG CHUN HAO"), "Dinner split", {})
+    assert not re.search(r"\$\w", p) and "money sent" in p and "to: ONG CHUN HAO" in p and "received" not in p
 
 
 if __name__ == "__main__":

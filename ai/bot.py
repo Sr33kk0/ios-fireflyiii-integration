@@ -1,8 +1,8 @@
 """Enrich Apple Pay transactions in Firefly III with a local Ollama model; review flags on Discord.
 
 Firefly webhook (STORE_TRANSACTION) -> classify with Ollama -> PUT back to Firefly -> ping Discord if unsure.
-Replying to a ping corrects the transaction. Transactions tagged `ask` are pinged as-is: the reply becomes
-the description and the model picks only the category. See README.md.
+Replying to a ping corrects the transaction. Transactions tagged `ask` (money received or sent) are pinged
+as-is: the reply becomes the description and the model picks only the category. See README.md.
 """
 import asyncio
 import hashlib
@@ -36,10 +36,10 @@ DISCORD_USER_ID = int(env("DISCORD_USER_ID") or 0)
 
 TAG = "applepay"
 PENDING = "Apple Pay pending"  # placeholder expense account the Shortcut books to
-ASK = "ask"  # tag: ping on Discord, the reply is the description (e.g. eWallet money received)
+ASK = "ask"  # tag: ping on Discord, the reply is the description (e.g. eWallet money received, bank transfer sent)
 NO_BUDGET = "(none)"
 CACHE_SECONDS = 3600
-CLASSIFY, CORRECT, INCOME = re.split(r"\n=== \w+ ===\n", Path(__file__).with_name("prompt.txt").read_text(encoding="utf-8"))
+CLASSIFY, CORRECT, NAMED = re.split(r"\n=== \w+ ===\n", Path(__file__).with_name("prompt.txt").read_text(encoding="utf-8"))
 log = logging.getLogger("ai")
 
 
@@ -95,7 +95,7 @@ def kind(label):
 def build_context(merchants, categories, budgets, splits):
     """History -> label map (most common category/budget per description), each merchant's dominant
     label kind (>= 80% of its transactions), counts, few-shot examples."""
-    done = [t for t in splits if not is_unprocessed(t)]
+    done = [t for t in splits if not is_unprocessed(t) and ASK not in (t.get("tags") or [])]  # `ask`: own flow
     combos, by_merchant = defaultdict(Counter), defaultdict(Counter)
     for t in done:
         combos[t["description"]][(t.get("category_name"), t.get("budget_name"))] += 1
@@ -117,11 +117,13 @@ def build_context(merchants, categories, budgets, splits):
     }
 
 
-def income_labels(splits):
-    """Past named `ask` transactions -> {name: most common category}."""
+def named_labels(splits, tx_type):
+    """Past named `ask` transactions of one type -> {name: most common category}. Sent and received
+    money keep separate histories."""
     combos = defaultdict(Counter)
     for t in splits:
-        combos[t["description"]][t.get("category_name")] += 1
+        if t["type"] == tx_type:
+            combos[t["description"]][t.get("category_name")] += 1
     return {name: c.most_common(1)[0][0] for name, c in combos.items()}
 
 
@@ -216,9 +218,11 @@ def correct_prompt(tx, raw, reply, ctx):
         labels=labels_text(ctx), merchants=", ".join(sorted(ctx["merchants"])))
 
 
-def income_prompt(tx, name, labels):
-    return Template(INCOME).safe_substitute(
-        locale=f" in {LOCALE}" if LOCALE else "", name=name, payer=tx["source_name"], amount=money(tx),
+def named_prompt(tx, name, labels):
+    sent = tx["type"] == "withdrawal"
+    return Template(NAMED).safe_substitute(
+        locale=f" in {LOCALE}" if LOCALE else "", name=name, direction="sent" if sent else "received",
+        party=f"to: {tx['destination_name']}" if sent else f"from: {tx['source_name']}", amount=money(tx),
         raw=parse_raw(tx), labels="\n".join(f"- {n} -> {c}" for n, c in labels.items()) or "(none yet)")
 
 
@@ -377,7 +381,7 @@ class Bot(discord.Client):
         same name, else the model."""
         name, category = split_reply(reply)
         groups = await self.ff_all("/search/transactions", {"query": f"tag_is:{ASK} has_any_category:true"})
-        labels = income_labels([t for g in groups for t in g["attributes"]["transactions"]])
+        labels = named_labels([t for g in groups for t in g["attributes"]["transactions"]], tx["type"])
         known = match_name(name, labels)
         if category:  # the owner's word beats history; a new name becomes a new Firefly category
             category = match_name(category, (await self.context())["categories"]) or category
@@ -385,7 +389,7 @@ class Bot(discord.Client):
         if known:  # history beats the model
             return {"description": known, "category_name": labels[known]}
         categories = (await self.context())["categories"] + [NO_BUDGET]  # "(none)": better blank than wrong
-        result = await self.ollama(income_prompt(tx, name, labels), {
+        result = await self.ollama(named_prompt(tx, name, labels), {
             "type": "object", "properties": {"category": {"type": "string", "enum": categories}}, "required": ["category"]})
         return {"description": name, "category_name": None if result["category"] == NO_BUDGET else result["category"]}
 
