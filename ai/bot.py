@@ -3,7 +3,8 @@
 Firefly webhook (STORE_TRANSACTION) -> classify with Ollama -> PUT back to Firefly -> ping Discord if unsure.
 Replying to a ping corrects the transaction. Transactions tagged `ask` (money received or sent) are pinged
 as-is: the reply becomes the description and the model picks only the category. An `ask` sent to or received
-from OWNER_NAME is half of an own transfer: the two halves are merged into one Firefly transfer. See README.md.
+from OWNER_NAME is half of an own transfer: the two halves are merged into one Firefly transfer. A half left alone
+is pinged, and the reply names the account that replaces OWNER_NAME. See README.md.
 """
 import asyncio
 import hashlib
@@ -41,8 +42,8 @@ PENDING = "Apple Pay pending"  # placeholder expense account the Shortcut books 
 ASK = "ask"  # tag: ping on Discord, the reply is the description (e.g. eWallet money received, bank transfer sent)
 NO_BUDGET = "(none)"
 CACHE_SECONDS = 3600
-PAIR_WINDOW = timedelta(minutes=15)  # max gap between the sent and received notification of one own transfer
-PAIR_WAIT = 600  # seconds a half waits for its other half before it is pinged
+PAIR_WINDOW = timedelta(minutes=2)  # max gap between the sent and received notification of one own transfer
+PAIR_WAIT = 150  # seconds a half waits for its other half before it is pinged: PAIR_WINDOW + slack for its webhook
 CLASSIFY, CORRECT, NAMED = re.split(r"\n=== \w+ ===\n", Path(__file__).with_name("prompt.txt").read_text(encoding="utf-8"))
 log = logging.getLogger("ai")
 
@@ -146,6 +147,13 @@ def own_partner(tx, candidates):
             if c["type"] != tx["type"] and is_own(c) and abs(float(c["amount"]) - float(tx["amount"])) < 0.005
             and gap(c) <= PAIR_WINDOW]
     return min(hits, key=lambda h: gap(h[1]), default=None)
+
+
+def own_ends(tx, account):
+    """Lone own-transfer half + the (id, name) asset account replacing OWNER_NAME -> (source, destination)."""
+    if tx["type"] == "withdrawal":
+        return (tx["source_id"], tx["source_name"]), account
+    return account, (tx["destination_id"], tx["destination_name"])
 
 
 def split_reply(reply):
@@ -359,13 +367,14 @@ class Bot(discord.Client):
             self.spawn(self.ask(group["id"], txs[0]))
         return web.Response(text="ok")  # answer now; Firefly gives up after 10s
 
-    async def ask(self, group_id, tx, note=""):
-        await self.post(f"<@{DISCORD_USER_ID}> ✏️ {note}reply with a name, or name / category\n"
+    async def ask(self, group_id, tx):
+        await self.post(f"<@{DISCORD_USER_ID}> ✏️ reply with a name, or name / category\n"
                         + summary(group_id, tx, None, parse_raw(tx)))
 
     async def pair(self, group_id, tx):
         """Own transfer: the sent half (a withdrawal to you) and the received half (a deposit from you) become
-        one Firefly transfer. The first half waits; a half still alone after PAIR_WAIT is pinged."""
+        one Firefly transfer. The first half waits; a half still alone after PAIR_WAIT asks for the account
+        behind OWNER_NAME."""
         try:
             async with self.pairing:  # both webhooks arrive together: don't let each merge the other
                 d = datetime.fromisoformat(tx["date"]).date()
@@ -379,7 +388,9 @@ class Bot(discord.Client):
             # ponytail: in-memory wait; a restart inside it drops the ping and the half stays as booked
             await asyncio.sleep(PAIR_WAIT)
             if group_id not in self.merged:
-                await self.ask(group_id, tx, "own transfer, other half never came: fix in Firefly, or ")
+                side = "destination" if tx["type"] == "withdrawal" else "source"
+                await self.post(f"<@{DISCORD_USER_ID}> 🔁 own transfer, other half never came: reply with the {side} "
+                                "account\n" + summary(group_id, tx, None, parse_raw(tx)))
         except Exception as e:
             log.exception("pairing #%s failed", group_id)
             await self.post(f"<@{DISCORD_USER_ID}> ❌ couldn't pair own transfer ({str(e)[:200]})\n"
@@ -387,15 +398,29 @@ class Bot(discord.Client):
 
     async def merge(self, group_id, tx, other_id, other):
         w, d = (tx, other) if tx["type"] == "withdrawal" else (other, tx)
+        await self.transfer((group_id, other_id), w, (w["source_id"], w["source_name"]),
+                            (d["destination_id"], d["destination_name"]), f"sent: {parse_raw(w)}\nreceived: {parse_raw(d)}")
+
+    async def relink(self, group_id, tx, reply):
+        """Reply to a lone own-transfer half: the named asset account replaces OWNER_NAME. -> (source, destination)"""
+        accounts = {a["attributes"]["name"]: a["id"] for a in await self.ff_all("/accounts", {"type": "asset"})}
+        name = match_name(reply, accounts)
+        if not name:
+            raise ValueError(f"no asset account {reply!r}, reply with one of: {', '.join(accounts)}")
+        source, destination = own_ends(tx, (accounts[name], name))
+        await self.transfer((group_id,), tx, source, destination,
+                            f"{'sent' if tx['type'] == 'withdrawal' else 'received'}: {parse_raw(tx)}")
+        return source[1], destination[1]
+
+    async def transfer(self, group_ids, tx, source, destination, notes):
+        """Book one transfer between (id, name) asset accounts at tx's date and amount, then delete the halves."""
         await self.ff("POST", "/transactions", json={"apply_rules": False, "fire_webhooks": False, "transactions": [{
-            "type": "transfer", "date": w["date"], "amount": w["amount"],
-            "description": f"{w['source_name']} to {d['destination_name']}",
-            "source_id": w["source_id"], "destination_id": d["destination_id"],
-            "notes": f"sent: {parse_raw(w)}\nreceived: {parse_raw(d)}"}]})
-        for gid in (group_id, other_id):  # transfer first: a failed delete leaves a duplicate, never a gap
+            "type": "transfer", "date": tx["date"], "amount": tx["amount"], "description": f"{source[1]} to {destination[1]}",
+            "source_id": source[0], "destination_id": destination[0], "notes": notes}]})
+        for gid in group_ids:  # transfer first: a failed delete leaves a duplicate, never a gap
             await self.ff("DELETE", f"/transactions/{gid}")
-        self.merged |= {group_id, other_id}
-        log.info("#%s + #%s -> transfer %s to %s", group_id, other_id, w["source_name"], d["destination_name"])
+        self.merged |= set(group_ids)
+        log.info("%s -> transfer %s to %s", " + ".join(f"#{g}" for g in group_ids), source[1], destination[1])
 
     async def enrich(self, group_id, tx):
         raw = parse_raw(tx)
@@ -464,6 +489,11 @@ class Bot(discord.Client):
             return
         try:
             tx = (await self.ff("GET", f"/transactions/{group_id}"))["data"]["attributes"]["transactions"][0]
+            if is_own(tx):  # pinged lone half; it is deleted now, so the edit drops its link
+                source, destination = await self.relink(group_id, tx, msg.content.strip())
+                await target.edit(content=f"✅ transfer {source} to {destination} · {money(tx)} · {when(tx)}")
+                await msg.add_reaction("✅")
+                return log.info("#%s relinked by reply %r -> %s to %s", group_id, msg.content, source, destination)
             if ASK in (tx.get("tags") or []):
                 f = await self.named(tx, msg.content.strip())
                 await self.update(group_id, tx["transaction_journal_id"], f)

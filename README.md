@@ -176,8 +176,10 @@ title filter to your app's, and check its notification text before reusing them.
 
 Money you move between your own accounts shows up twice: sent from one account (step 6) and received in
 another. Set `OWNER_NAME` to your name as the notifications print it, and the service merges the two halves
-(same amount, within 15 minutes) into one Firefly transfer, in any direction between any of your accounts. A
-half whose other half never arrives is pinged after 10 minutes.
+(same amount, within 2 minutes) into one Firefly transfer, in any direction between any of your accounts. A
+half whose other half never arrives is pinged after 2½ minutes: reply with the asset account on the other end
+(the destination for money sent, the source for money received) and it becomes the transfer in place of your
+name.
 
 ### 6. Money sent (optional)
 

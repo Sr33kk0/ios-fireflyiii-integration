@@ -159,6 +159,14 @@ def test_own_partner():
     assert not bot.is_own(sent)  # unset: no pairing
 
 
+def test_own_ends():
+    # the replied account takes OWNER_NAME's side: destination of money sent, source of money received
+    sent = {**tx("HO SHOU YEE", dest="HO SHOU YEE", tags=["ask"]), "source_id": "1"}
+    assert bot.own_ends(sent, ("9", "Ryt Bank")) == (("1", "Main Account"), ("9", "Ryt Bank"))
+    got = {**tx("HO SHOU YEE", dest="Ryt Bank", tags=["ask"], type="deposit"), "destination_id": "9"}
+    assert bot.own_ends(got, ("1", "Main Account")) == (("1", "Main Account"), ("9", "Ryt Bank"))
+
+
 def test_split_reply():
     assert bot.split_reply(" Allowance from Parents / Family ") == ("Allowance from Parents", "Family")
     assert bot.split_reply("Allowance from Parents") == ("Allowance from Parents", None)
