@@ -16,7 +16,7 @@ import os
 import re
 import time
 from collections import Counter, defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from string import Template
 
@@ -47,6 +47,8 @@ PAIR_WINDOW = timedelta(minutes=2)  # max gap between the sent and received noti
 PAIR_WAIT = 150  # seconds a half waits for its other half before it is pinged: PAIR_WINDOW + slack for its webhook
 USUAL_MIN = 3  # uses of one name before a party gets it without asking
 HISTORY = timedelta(days=365)  # how far back labels, merchants and raw strings are learned from
+SWEEP_EVERY = 900  # seconds between sweeps for taps a webhook missed or failed on
+ASK_EVERY = 96  # sweeps between pings again for unanswered `ask`s: daily
 CLASSIFY, CORRECT, NAMED = re.split(r"\n=== \w+ ===\n", Path(__file__).with_name("prompt.txt").read_text(encoding="utf-8"))
 log = logging.getLogger("ai")
 
@@ -78,7 +80,9 @@ def parse_raw(tx):
 
 
 def is_unprocessed(tx):
-    return TAG in (tx.get("tags") or []) and not tx.get("category_name")
+    """A tap nothing has labelled yet: still on PENDING, no category. A category alone is no marker: a label can
+    map to none, and a reply to a failed tap can name the label but leave the merchant pending."""
+    return TAG in (tx.get("tags") or []) and tx["destination_name"] == PENDING and not tx.get("category_name")
 
 
 def party(tx):
@@ -113,7 +117,8 @@ def kind(label):
 def build_context(merchants, categories, budgets, splits):
     """History -> label map (most common category/budget per description), each merchant's dominant
     label kind (>= 80% of its transactions), counts, few-shot examples."""
-    done = [t for t in splits if not is_unprocessed(t) and ASK not in (t.get("tags") or [])]  # `ask`: own flow
+    # a tap still on PENDING has no merchant to teach; `ask`: own flow
+    done = [t for t in splits if t["destination_name"] != PENDING and ASK not in (t.get("tags") or [])]
     combos, by_merchant = defaultdict(Counter), defaultdict(Counter)
     for t in done:
         combos[t["description"]][(t.get("category_name"), t.get("budget_name"))] += 1
@@ -320,7 +325,7 @@ class Bot(discord.Client):
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", 8000).start()
-        self.spawn(self.sweep())
+        self.spawn(self.sweep_loop())
 
     # --- Firefly ---
 
@@ -475,7 +480,8 @@ class Bot(discord.Client):
         self.merged |= set(group_ids)
         log.info("%s -> transfer %s to %s", " + ".join(f"#{g}" for g in group_ids), source[1], destination[1])
 
-    async def enrich(self, group_id, tx):
+    async def enrich(self, group_id, tx, loud=True):
+        """Label one tap. loud=False (a sweep retrying it): a failure is only logged, the next sweep tries again."""
         raw, hour = parse_raw(tx), datetime.fromisoformat(tx["date"]).hour
         try:
             ctx = await self.context()
@@ -486,42 +492,57 @@ class Bot(discord.Client):
                 f, reasons = finalize(result, ctx, hour)
         except Exception as e:
             log.exception("classify #%s failed", group_id)
-            return await self.post(f"<@{DISCORD_USER_ID}> ❌ couldn't classify ({str(e)[:200]}), reply to fix\n"
-                                   + summary(group_id, tx, None, raw))
+            if loud:
+                await self.post(f"<@{DISCORD_USER_ID}> ❌ couldn't classify ({str(e)[:200]}), reply to fix\n"
+                                + summary(group_id, tx, None, raw))
+            return
         try:
             await self.update(group_id, tx["transaction_journal_id"], f)
         except Exception as e:
             log.exception("update #%s failed", group_id)
-            return await self.post(f"<@{DISCORD_USER_ID}> ❌ failed to update #{group_id}: {str(e)[:300]}\n"
-                                   + summary(group_id, tx, f, raw))
+            if loud:
+                await self.post(f"<@{DISCORD_USER_ID}> ❌ failed to update #{group_id}: {str(e)[:300]}\n"
+                                + summary(group_id, tx, f, raw))
+            return
         log.info("#%s %r -> %s %s", group_id, raw, f, reasons)
         if reasons:
             conf = result["confidence"] / 100 if result["confidence"] > 1 else result["confidence"]
             await self.post(f"<@{DISCORD_USER_ID}> ⚠️ {', '.join(reasons)} · {conf:.0%}\n" + summary(group_id, tx, f, raw))
 
-    async def sweep(self):
-        """Catch Apple Pay taps and `ask`s that arrived while this service was down. An `ask` still unanswered
-        is pinged again, even if it was pinged before the restart."""
+    async def sweep_loop(self):
+        """Sweep at startup, then every SWEEP_EVERY. Only the startup sweep pings for a tap that fails again;
+        unanswered `ask`s are pinged at startup and every ASK_EVERY sweeps after."""
+        n = 0
+        while True:
+            try:
+                await self.sweep(asks=n % ASK_EVERY == 0, loud=n == 0)
+            except Exception as e:  # after a reboot Firefly may still be migrating
+                log.warning("sweep: Firefly not ready (%s), retrying in 60s", e)
+                await asyncio.sleep(60)
+                continue
+            n += 1
+            await asyncio.sleep(SWEEP_EVERY)
+
+    async def sweep(self, asks=True, loud=True):
+        """Label taps of the last 7 days that a webhook missed or failed on (this service, Firefly or Ollama was
+        down). With `asks`, ping again for every `ask` still unanswered, even one pinged before."""
         since = (date.today() - timedelta(days=7)).isoformat()
         search = lambda tag: self.ff_all("/search/transactions",
                                          {"query": f"tag_is:{tag} has_no_category:true date_after:{since}"})
-        for _ in range(20):  # after a reboot Firefly may still be migrating; give it ~5 min
-            try:
-                groups, asks = await search(TAG), await search(ASK)
-                break
-            except Exception as e:
-                log.warning("startup sweep: Firefly not ready (%s), retrying in 15s", e)
-                await asyncio.sleep(15)
-        else:
-            return log.error("startup sweep gave up")
+        # both searches before acting: a sweep retried after a failed search pings nothing twice
+        groups, ask_groups = await search(TAG), (await search(ASK) if asks else [])
         singles = lambda gs: [(int(g["id"]), g["attributes"]["transactions"][0]) for g in gs
                                if len(g["attributes"]["transactions"]) == 1]
-        unanswered = [(gid, t) for gid, t in singles(asks) if is_unanswered(t)]
-        log.info("startup sweep: %d unprocessed, %d unanswered", len(groups), len(unanswered))
+        settled = datetime.now(timezone.utc) - timedelta(minutes=5)  # a younger tap may still be with its webhook
+        taps = [(gid, t) for gid, t in singles(groups)
+                if is_unprocessed(t) and datetime.fromisoformat(t["date"]) < settled]
+        unanswered = [(gid, t) for gid, t in singles(ask_groups) if is_unanswered(t)]
+        if taps or unanswered:
+            log.info("sweep: %d unprocessed, %d unanswered", len(taps), len(unanswered))
         for gid, t in unanswered:
             self.route(gid, t)
-        for gid, t in singles(groups):
-            await self.enrich(gid, t)
+        for gid, t in taps:
+            await self.enrich(gid, t, loud)
 
     async def named(self, tx, reply):
         """`ask` reply -> description; category as typed (`name / category`), else from a past use of the

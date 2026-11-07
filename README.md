@@ -19,8 +19,9 @@ with category and budget set, where the bank only gave you `MCDONALDS MAIN STREE
 - **Fix by replying.** Reply to a ping in plain words (`dessert`, `drinks at Starbucks`,
   `merchant Sweet Scoop, budget (none)`) and the transaction is corrected.
 - **Meals by the clock.** Restaurants become Breakfast, Lunch or Dinner from the time of the tap.
-- **Catches up.** On startup it re-checks unlabelled Apple Pay transactions from the last 7 days and pings
-  again for money nobody has named yet, so nothing is lost while the service is down.
+- **Catches up.** Every 15 minutes it re-checks Apple Pay taps from the last 7 days that are still unlabelled,
+  so a tap that came in while the service, Firefly or Ollama was down still gets labelled. On startup and once
+  a day it pings again for money nobody has named yet.
 - **Signed webhooks.** Every Firefly webhook is verified with HMAC-SHA3-256 before it is processed.
 
 ## Requirements
