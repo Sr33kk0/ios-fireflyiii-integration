@@ -11,15 +11,16 @@ with category and budget set, where the bank only gave you `MCDONALDS MAIN STREE
 ## Features
 
 - **Local AI.** Merchant names and amounts go to your own Ollama model, not a cloud API.
-- **Learns from your history.** Labels, categories and budgets come from your past Firefly transactions.
-  A merchant you have corrected once keeps that label from then on.
+- **Learns from your history.** Labels, categories and budgets come from your last 12 months of Firefly
+  transactions. A raw merchant string seen before keeps its merchant, even after you corrected it, and skips the
+  model when that merchant has a usual label.
 - **Asks only when needed.** You get a Discord ping for a new merchant, a new label, an unknown category,
   or low model confidence. Everything else is booked silently.
 - **Fix by replying.** Reply to a ping in plain words (`dessert`, `drinks at Starbucks`,
   `merchant Sweet Scoop, budget (none)`) and the transaction is corrected.
 - **Meals by the clock.** Restaurants become Breakfast, Lunch or Dinner from the time of the tap.
-- **Catches up.** On startup it re-checks unlabelled Apple Pay transactions from the last 7 days, so
-  nothing is lost while the service is down.
+- **Catches up.** On startup it re-checks unlabelled Apple Pay transactions from the last 7 days and pings
+  again for money nobody has named yet, so nothing is lost while the service is down.
 - **Signed webhooks.** Every Firefly webhook is verified with HMAC-SHA3-256 before it is processed.
 
 ## Requirements
@@ -38,7 +39,7 @@ with category and budget set, where the bank only gave you `MCDONALDS MAIN STREE
 | `docker-compose.yml` | Firefly III, MariaDB, data importer, cron, and the `ai` service |
 | `ai/bot.py` | Webhook receiver, Ollama classifier, Discord bot |
 | `ai/prompt.txt` | Classification and correction prompts (edit to fit your spending) |
-| `ai/test_bot.py` | Plain-assert checks for the pure logic |
+| `ai/test_bot.py` | Plain-assert checks for the logic and flows |
 | `assets/flow.html` | Source of the flow diagram above (`assets/flow.png` is its export) |
 
 ## Setup
@@ -151,6 +152,9 @@ service pings you on Discord, your reply becomes the description, and the model 
 you have used before keeps its category). The model picks only from existing categories and leaves it blank
 when none fits. Reply `name / category` to set the category yourself: `Allowance from Parents / Allowance`
 creates the category if it is new, and that name keeps it from then on. `/ (none)` leaves it blank.
+
+Someone who has had one name at least 3 times, and in at least 80% of their transactions, gets it without a ping.
+The bot posts a quiet note instead, and replying to it corrects the name as usual.
 
 **Automation → + → Notification**, pick the app, filter *Title contains* `received money`, **Run Immediately**:
 

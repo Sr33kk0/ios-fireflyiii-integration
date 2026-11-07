@@ -2,9 +2,10 @@
 
 Firefly webhook (STORE_TRANSACTION) -> classify with Ollama -> PUT back to Firefly -> ping Discord if unsure.
 Replying to a ping corrects the transaction. Transactions tagged `ask` (money received or sent) are pinged
-as-is: the reply becomes the description and the model picks only the category. An `ask` sent to or received
-from OWNER_NAME is half of an own transfer: the two halves are merged into one Firefly transfer. A half left alone
-is pinged, and the reply names the account that replaces OWNER_NAME. See README.md.
+as-is: the reply becomes the description and the model picks only the category; a party that nearly always gets
+one name is booked with it, unpinged. An `ask` sent to or received from OWNER_NAME is half of an own transfer: the
+two halves are merged into one Firefly transfer. A half left alone is pinged, and the reply names the account that
+replaces OWNER_NAME. See README.md.
 """
 import asyncio
 import hashlib
@@ -44,6 +45,8 @@ NO_BUDGET = "(none)"
 CACHE_SECONDS = 3600
 PAIR_WINDOW = timedelta(minutes=2)  # max gap between the sent and received notification of one own transfer
 PAIR_WAIT = 150  # seconds a half waits for its other half before it is pinged: PAIR_WINDOW + slack for its webhook
+USUAL_MIN = 3  # uses of one name before a party gets it without asking
+HISTORY = timedelta(days=365)  # how far back labels, merchants and raw strings are learned from
 CLASSIFY, CORRECT, NAMED = re.split(r"\n=== \w+ ===\n", Path(__file__).with_name("prompt.txt").read_text(encoding="utf-8"))
 log = logging.getLogger("ai")
 
@@ -78,6 +81,16 @@ def is_unprocessed(tx):
     return TAG in (tx.get("tags") or []) and not tx.get("category_name")
 
 
+def party(tx):
+    """Who the money went to or came from."""
+    return tx["destination_name"] if tx["type"] == "withdrawal" else tx["source_name"]
+
+
+def is_unanswered(tx):
+    """An `ask` nobody named yet: the Shortcut books the party as its description."""
+    return ASK in (tx.get("tags") or []) and not tx.get("category_name") and norm(tx["description"]) == norm(party(tx))
+
+
 def when(tx, fmt="%a %H:%M"):
     # ponytail: uses the offset Firefly returns (its TZ), no tz conversion needed
     return datetime.fromisoformat(tx["date"]).strftime(fmt)
@@ -107,9 +120,9 @@ def build_context(merchants, categories, budgets, splits):
         by_merchant[t["destination_name"]][kind(t["description"])] += 1
     merchant_kind = {m: c.most_common(1)[0][0] for m, c in by_merchant.items()
                      if c.most_common(1)[0][1] >= 0.8 * sum(c.values())}
-    recent = sorted(done, key=lambda t: t["date"], reverse=True)[:30]
+    recent = sorted(done, key=lambda t: t["date"], reverse=True)
     examples = [f"{when(t)} {money(t)} -> {t['description']} @ {t['destination_name']}"
-                + (f' (raw "{parse_raw(t)}")' if TAG in (t.get("tags") or []) else "") for t in recent]
+                + (f' (raw "{parse_raw(t)}")' if TAG in (t.get("tags") or []) else "") for t in recent[:30]]
     return {
         "merchants": [m for m in merchants if m != PENDING],
         "categories": categories,
@@ -119,6 +132,8 @@ def build_context(merchants, categories, budgets, splits):
         "merchant_kind": merchant_kind,
         "seen": set(by_merchant),  # merchants with withdrawal history
         "examples": examples,
+        # oldest first so the newest wins: a corrected tap replaces the model's first guess
+        "raw_merchant": {norm(parse_raw(t)): t["destination_name"] for t in reversed(recent) if TAG in (t.get("tags") or [])},
     }
 
 
@@ -132,10 +147,16 @@ def named_labels(splits, tx_type):
     return {name: c.most_common(1)[0][0] for name, c in combos.items()}
 
 
+def usual_name(tx, splits):
+    """The name tx's party nearly always gets among past named `ask` splits (>= USUAL_MIN uses, >= 80%), else None."""
+    names = Counter(t["description"] for t in splits if t["type"] == tx["type"] and norm(party(t)) == norm(party(tx)))
+    name, uses = (names.most_common(1) or [(None, 0)])[0]
+    return name if uses >= USUAL_MIN and uses >= 0.8 * sum(names.values()) else None
+
+
 def is_own(tx):
     """An `ask` half of a transfer between your own accounts: sent to you, or received from you."""
-    party = tx["destination_name"] if tx["type"] == "withdrawal" else tx["source_name"]
-    return bool(OWNER_NAME) and ASK in (tx.get("tags") or []) and norm(party) == norm(OWNER_NAME)
+    return bool(OWNER_NAME) and ASK in (tx.get("tags") or []) and norm(party(tx)) == norm(OWNER_NAME)
 
 
 def own_partner(tx, candidates):
@@ -193,6 +214,16 @@ def finalize(result, ctx, hour):
     if confidence < CONFIDENCE_MIN:
         reasons.append("low confidence")
     return fields(label, merchant, category, budget), reasons
+
+
+def remembered(raw, ctx, hour):
+    """Firefly fields for a raw string history already settles, else None: the model is needed."""
+    merchant = ctx["raw_merchant"].get(norm(raw))
+    label = ctx["merchant_kind"].get(merchant)
+    if not label:
+        return None
+    f, reasons = finalize({"description": label, "merchant": merchant, "category": None, "budget": None, "confidence": 1}, ctx, hour)
+    return None if reasons else f
 
 
 def apply_correction(tx, patch, ctx):
@@ -318,7 +349,10 @@ class Bot(discord.Client):
         merchants = names(await self.ff_all("/accounts", {"type": "expense"}))
         categories = names(await self.ff_all("/categories", {}))
         budgets = names([b for b in await self.ff_all("/budgets", {}) if b["attributes"].get("active", True)])
-        groups = await self.ff_all("/transactions", {"type": "withdrawal"})
+        # ponytail: refetched after every update; a merchant unused for HISTORY counts as new. Patch ctx in place if slow
+        today = date.today()
+        groups = await self.ff_all("/transactions", {"type": "withdrawal", "start": (today - HISTORY).isoformat(),
+                                                     "end": (today + timedelta(days=1)).isoformat()})
         splits = [t for g in groups for t in g["attributes"]["transactions"]]
         self.ctx, self.ctx_at = build_context(merchants, categories, budgets, splits), time.monotonic()
         return self.ctx
@@ -361,15 +395,34 @@ class Bot(discord.Client):
         tags = (txs[0].get("tags") or []) if len(txs) == 1 else []
         if TAG in tags:
             self.spawn(self.enrich(group["id"], txs[0]))
-        elif ASK in tags and is_own(txs[0]):
-            self.spawn(self.pair(int(group["id"]), txs[0]))
         elif ASK in tags:
-            self.spawn(self.ask(group["id"], txs[0]))
+            self.route(int(group["id"]), txs[0])
+        else:
+            log.info("#%s ignored: tags=%s splits=%d", group["id"], tags, len(txs))
         return web.Response(text="ok")  # answer now; Firefly gives up after 10s
 
+    def route(self, group_id, tx):
+        self.spawn(self.pair(group_id, tx) if is_own(tx) else self.ask(group_id, tx))
+
+    async def ask_history(self):
+        groups = await self.ff_all("/search/transactions", {"query": f"tag_is:{ASK} has_any_category:true"})
+        return [t for g in groups for t in g["attributes"]["transactions"]]
+
     async def ask(self, group_id, tx):
-        await self.post(f"<@{DISCORD_USER_ID}> ✏️ reply with a name, or name / category\n"
-                        + summary(group_id, tx, None, parse_raw(tx)))
+        """Book a party's usual name unpinged (a reply still corrects it), else ask for one."""
+        raw = parse_raw(tx)
+        try:
+            splits = await self.ask_history()
+            name = usual_name(tx, splits)
+            if name:
+                f = {"description": name, "category_name": named_labels(splits, tx["type"])[name]}
+                await self.update(group_id, tx["transaction_journal_id"], f)
+                log.info("#%s named from history -> %s", group_id, f)
+                return await self.post(f"🤖 {name} ({f['category_name']}), reply to fix\n" + summary(group_id, tx, None, raw))
+        except Exception:
+            log.exception("usual name for #%s failed, asking instead", group_id)
+        log.info("#%s pinged for a name", group_id)
+        await self.post(f"<@{DISCORD_USER_ID}> ✏️ reply with a name, or name / category\n" + summary(group_id, tx, None, raw))
 
     async def pair(self, group_id, tx):
         """Own transfer: the sent half (a withdrawal to you) and the received half (a deposit from you) become
@@ -385,7 +438,7 @@ class Bot(discord.Client):
                                        for g in groups if len(g["attributes"]["transactions"]) == 1})
                 if hit:
                     return await self.merge(group_id, tx, *hit)
-            # ponytail: in-memory wait; a restart inside it drops the ping and the half stays as booked
+            # ponytail: in-memory wait; a restart inside it is caught by the startup sweep
             await asyncio.sleep(PAIR_WAIT)
             if group_id not in self.merged:
                 side = "destination" if tx["type"] == "withdrawal" else "source"
@@ -423,11 +476,14 @@ class Bot(discord.Client):
         log.info("%s -> transfer %s to %s", " + ".join(f"#{g}" for g in group_ids), source[1], destination[1])
 
     async def enrich(self, group_id, tx):
-        raw = parse_raw(tx)
+        raw, hour = parse_raw(tx), datetime.fromisoformat(tx["date"]).hour
         try:
             ctx = await self.context()
-            result = await self.ollama(classify_prompt(tx, raw, ctx), schema(ctx))
-            f, reasons = finalize(result, ctx, datetime.fromisoformat(tx["date"]).hour)
+            f, reasons = remembered(raw, ctx, hour), []
+            if not f:
+                result = await self.ollama(classify_prompt(tx, raw, ctx), schema(ctx))
+                result["merchant"] = ctx["raw_merchant"].get(norm(raw), result["merchant"])  # history beats the model
+                f, reasons = finalize(result, ctx, hour)
         except Exception as e:
             log.exception("classify #%s failed", group_id)
             return await self.post(f"<@{DISCORD_USER_ID}> ❌ couldn't classify ({str(e)[:200]}), reply to fix\n"
@@ -444,30 +500,34 @@ class Bot(discord.Client):
             await self.post(f"<@{DISCORD_USER_ID}> ⚠️ {', '.join(reasons)} · {conf:.0%}\n" + summary(group_id, tx, f, raw))
 
     async def sweep(self):
-        """Catch Apple Pay transactions that arrived while this service was down."""
+        """Catch Apple Pay taps and `ask`s that arrived while this service was down. An `ask` still unanswered
+        is pinged again, even if it was pinged before the restart."""
         since = (date.today() - timedelta(days=7)).isoformat()
+        search = lambda tag: self.ff_all("/search/transactions",
+                                         {"query": f"tag_is:{tag} has_no_category:true date_after:{since}"})
         for _ in range(20):  # after a reboot Firefly may still be migrating; give it ~5 min
             try:
-                groups = await self.ff_all("/search/transactions",
-                                           {"query": f"tag_is:{TAG} has_no_category:true date_after:{since}"})
+                groups, asks = await search(TAG), await search(ASK)
                 break
             except Exception as e:
                 log.warning("startup sweep: Firefly not ready (%s), retrying in 15s", e)
                 await asyncio.sleep(15)
         else:
             return log.error("startup sweep gave up")
-        log.info("startup sweep: %d unprocessed", len(groups))
-        for g in groups:
-            txs = g["attributes"]["transactions"]
-            if len(txs) == 1:
-                await self.enrich(int(g["id"]), txs[0])
+        singles = lambda gs: [(int(g["id"]), g["attributes"]["transactions"][0]) for g in gs
+                               if len(g["attributes"]["transactions"]) == 1]
+        unanswered = [(gid, t) for gid, t in singles(asks) if is_unanswered(t)]
+        log.info("startup sweep: %d unprocessed, %d unanswered", len(groups), len(unanswered))
+        for gid, t in unanswered:
+            self.route(gid, t)
+        for gid, t in singles(groups):
+            await self.enrich(gid, t)
 
     async def named(self, tx, reply):
         """`ask` reply -> description; category as typed (`name / category`), else from a past use of the
         same name, else the model."""
         name, category = split_reply(reply)
-        groups = await self.ff_all("/search/transactions", {"query": f"tag_is:{ASK} has_any_category:true"})
-        labels = named_labels([t for g in groups for t in g["attributes"]["transactions"]], tx["type"])
+        labels = named_labels(await self.ask_history(), tx["type"])
         known = match_name(name, labels)
         if category:  # the owner's word beats history; a new name becomes a new Firefly category
             category = match_name(category, (await self.context())["categories"]) or category
