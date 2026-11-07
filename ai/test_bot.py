@@ -82,6 +82,17 @@ def test_parse_raw():
         "A has transferred $0.01 to you."
 
 
+def test_foreign_paid():
+    paid = lambda amount: {**tx("X", notes=f"raw: SHOP | card: My Visa | amount: {amount}"), "currency_code": "EUR"}
+    assert bot.foreign_paid(paid("¥1,200")) == "¥1,200"
+    assert bot.foreign_paid(paid("JPY 1,200 ")) == "JPY 1,200"
+    assert bot.foreign_paid(paid("1.299,00 €")) is None  # the account's own currency, by symbol or code
+    assert bot.foreign_paid(paid("eur 12.50")) is None
+    assert bot.foreign_paid(paid("12.50")) is None  # no unit: nothing to compare
+    assert bot.foreign_paid(tx("X", notes="raw: SHOP | card: My Visa")) is None  # Shortcut without `amount:`
+    assert bot.parse_raw(paid("¥1,200")) == "SHOP"
+
+
 def ctx():
     splits = [
         tx("Lunch", "Food", "Food", "McDonald’s"),
@@ -339,6 +350,15 @@ def test_enrich_skips_model_for_known_raw():
     assert b.updates == [(5, {"description": "Fuel", "destination_name": "Shell", "category_name": "Transport",
                               "budget_name": "Transport"})]
     assert b.posts == []
+
+
+def test_enrich_flags_foreign_amount():
+    b = Stub()
+    b.ctx, b.ctx_at = ctx(), time.monotonic()
+    asyncio.run(b.enrich(5, tx("SHELL 24", tags=["applepay"], amount="1200",
+                               notes="raw: SHELL 24 | card: My Visa | amount: ¥1,200")))
+    assert b.updates[0][1]["description"] == "Fuel"  # labelled from history as usual, no model
+    assert "<@" in b.posts[0] and "paid ¥1,200, booked €1200.00" in b.posts[0] and "100%" in b.posts[0]
 
 
 def test_enrich_keeps_remembered_merchant():

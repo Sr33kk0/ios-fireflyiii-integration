@@ -15,7 +15,7 @@ with category and budget set, where the bank only gave you `MCDONALDS MAIN STREE
   transactions. A raw merchant string seen before keeps its merchant, even after you corrected it, and skips the
   model when that merchant has a usual label.
 - **Asks only when needed.** You get a Discord ping for a new merchant, a new label, an unknown category,
-  or low model confidence. Everything else is booked silently.
+  low model confidence, or a tap in another currency. Everything else is booked silently.
 - **Fix by replying.** Reply to a ping in plain words (`dessert`, `drinks at Starbucks`,
   `merchant Sweet Scoop, budget (none)`) and the transaction is corrected.
 - **Meals by the clock.** Restaurants become Breakfast, Lunch or Dinner from the time of the tap.
@@ -126,7 +126,9 @@ then **New Blank Automation** with these actions:
 1. **Dictionary**: map each Wallet card name to its Firefly asset account,
    e.g. `My Visa` → `Main Account`.
 2. **Get Dictionary Value** for key *Shortcut Input → Card or Pass*.
-3. **Replace Text** in *Shortcut Input → Amount*: regex `[^0-9.]` → nothing. This turns `$1,299.00` into `1299.00`.
+3. **Replace Text** in *Shortcut Input → Amount*: regex `[^0-9.,]|[.,](?=[0-9]{3}\b)` → nothing, then
+   **Replace Text** `,` → `.`. This turns `$1,299.00`, `1.299,00 €` and `12,50 €` into `1299.00`, `1299.00`
+   and `12.50`, whatever your region's number format.
 4. **Format Date**: *Current Date*, ISO 8601, include time.
 5. **Text**, inserting the variables where shown:
 
@@ -135,8 +137,10 @@ then **New Blank Automation** with these actions:
      "type": "withdrawal", "date": "[Formatted Date]", "amount": "[Updated Text]",
      "description": "[Merchant]", "source_name": "[Dictionary Value]",
      "destination_name": "Apple Pay pending", "tags": ["applepay"],
-     "notes": "raw: [Merchant] | card: [Card or Pass]"}]}
+     "notes": "raw: [Merchant] | card: [Card or Pass] | amount: [Amount]"}]}
    ```
+
+   `[Amount]` is *Shortcut Input → Amount* as Wallet shows it, before step 3.
 
 6. **Get Contents of URL**: `http://<firefly-host>/api/v1/transactions`, method POST, headers
    `Authorization: Bearer <iphone token>`, `Accept: application/json` and `Content-Type: application/json`,
@@ -144,7 +148,8 @@ then **New Blank Automation** with these actions:
 
 `<firefly-host>` is the address your phone uses to reach Firefly, such as the PC's Tailscale IP or MagicDNS
 name. Keep the `applepay` tag, the `Apple Pay pending` destination and the `raw: … | card: …` notes format:
-the service relies on all three.
+the service relies on all three. The `| amount: …` part is optional: with it, a tap in another currency is
+flagged on Discord, because the Shortcut keeps only the digits and books `¥1,200` as 1200 in your currency.
 
 ### 5. Money received (optional)
 
@@ -238,6 +243,9 @@ docker compose run --rm --no-deps ai python test_bot.py
 
 - Only in-store taps trigger the iOS Transaction automation. Online and in-app Apple Pay payments usually don't.
 - Split transactions are skipped, since updating one split would drop the others.
+- A tap in another currency is only flagged, not converted: fix its amount in Firefly from the link in the ping.
+- The amount regex reads three digits after the last separator as thousands, so three-decimal currencies
+  (`KWD 1.250`) come out wrong.
 - Discord sees a short summary of each flagged transaction: amount, time, account, label and raw merchant.
 
 ## License

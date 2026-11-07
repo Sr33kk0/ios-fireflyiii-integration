@@ -79,6 +79,17 @@ def parse_raw(tx):
     return m.group(1) if m else tx["description"]
 
 
+def foreign_paid(tx):
+    """The tap's amount as Wallet showed it (`| amount:` in its notes) when its currency is not the account's,
+    else None: the Shortcut keeps only the digits, so ¥1,200 is booked as 1200 of the account's currency."""
+    m = re.search(r"\|\s*amount:\s*(.*\S)", tx.get("notes") or "")
+    if not m:
+        return None
+    unit = re.sub(r"[\d.,'\s+-]", "", m.group(1)).casefold()  # "¥1,200" -> "¥", "MYR 12.50" -> "myr"
+    home = {(tx.get(k) or "").casefold() for k in ("currency_symbol", "currency_code")}
+    return m.group(1) if unit and unit not in home else None
+
+
 def is_unprocessed(tx):
     """A tap nothing has labelled yet: still on PENDING, no category. A category alone is no marker: a label can
     map to none, and a reply to a failed tap can name the label but leave the merchant pending."""
@@ -193,6 +204,11 @@ def fields(description, merchant, category, budget):
             "budget_name": None if budget in (None, NO_BUDGET) else budget}
 
 
+def confidence(result):
+    """0..1; some models answer 62 for 0.62."""
+    return result["confidence"] / 100 if result["confidence"] > 1 else result["confidence"]
+
+
 def finalize(result, ctx, hour):
     """Model output -> (Firefly fields, flag reasons).
     History beats the model: a known merchant keeps its usual label, meals are named by the hour,
@@ -215,8 +231,7 @@ def finalize(result, ctx, hour):
     if category is not None and category not in ctx["categories"]:
         category = None
         reasons.append("unknown category")
-    confidence = result["confidence"] / 100 if result["confidence"] > 1 else result["confidence"]
-    if confidence < CONFIDENCE_MIN:
+    if confidence(result) < CONFIDENCE_MIN:
         reasons.append("low confidence")
     return fields(label, merchant, category, budget), reasons
 
@@ -485,11 +500,12 @@ class Bot(discord.Client):
         raw, hour = parse_raw(tx), datetime.fromisoformat(tx["date"]).hour
         try:
             ctx = await self.context()
-            f, reasons = remembered(raw, ctx, hour), []
+            f, reasons, conf = remembered(raw, ctx, hour), [], 1
             if not f:
                 result = await self.ollama(classify_prompt(tx, raw, ctx), schema(ctx))
                 result["merchant"] = ctx["raw_merchant"].get(norm(raw), result["merchant"])  # history beats the model
                 f, reasons = finalize(result, ctx, hour)
+                conf = confidence(result)
         except Exception as e:
             log.exception("classify #%s failed", group_id)
             if loud:
@@ -504,9 +520,11 @@ class Bot(discord.Client):
                 await self.post(f"<@{DISCORD_USER_ID}> ❌ failed to update #{group_id}: {str(e)[:300]}\n"
                                 + summary(group_id, tx, f, raw))
             return
+        paid = foreign_paid(tx)
+        if paid:
+            reasons.append(f"paid {paid}, booked {money(tx)}: fix the amount")
         log.info("#%s %r -> %s %s", group_id, raw, f, reasons)
         if reasons:
-            conf = result["confidence"] / 100 if result["confidence"] > 1 else result["confidence"]
             await self.post(f"<@{DISCORD_USER_ID}> ⚠️ {', '.join(reasons)} · {conf:.0%}\n" + summary(group_id, tx, f, raw))
 
     async def sweep_loop(self):
