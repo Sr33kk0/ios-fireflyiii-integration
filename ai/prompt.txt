@@ -66,3 +66,7 @@ Pick the best fitting category from the allowed values, or "(none)" if none real
 
 Money $direction before (name -> category):
 $labels
+
+=== guess ===
+Money was sent by bank transfer to "$payee" ($amount). Notification: $raw
+What is the payee? Answer with one of: $kinds

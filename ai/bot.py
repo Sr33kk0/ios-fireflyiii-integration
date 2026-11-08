@@ -3,9 +3,9 @@
 Firefly webhook (STORE_TRANSACTION) -> classify with Ollama -> PUT back to Firefly -> ping Discord if unsure.
 Replying to a ping corrects the transaction. Transactions tagged `ask` (money received or sent) are pinged
 as-is: the reply becomes the description and the model picks only the category; a party that nearly always gets
-one name is booked with it, unpinged. An `ask` sent to or received from OWNER_NAME is half of an own transfer: the
-two halves are merged into one Firefly transfer. A half left alone is pinged, and the reply names the account that
-replaces OWNER_NAME. See README.md.
+one name is booked with it, unpinged. Other money sent is booked with a guessed name, so a reply only fixes it.
+An `ask` sent to or received from OWNER_NAME is half of an own transfer: the two halves are merged into one Firefly
+transfer. A half left alone is pinged, and the reply names the account that replaces OWNER_NAME. See README.md.
 """
 import asyncio
 import hashlib
@@ -46,10 +46,14 @@ CACHE_SECONDS = 3600
 PAIR_WINDOW = timedelta(minutes=2)  # max gap between the sent and received notification of one own transfer
 PAIR_WAIT = 150  # seconds a half waits for its other half before it is pinged: PAIR_WINDOW + slack for its webhook
 USUAL_MIN = 3  # uses of one name before a party gets it without asking
+# what the model may take a payee for -> the label guessed for money sent to it (Meal: by the hour). On 24 past
+# payments, payee history then this got 20 right; the 4 misses were one-offs (a gift, a movie ticket).
+PAYEE_KINDS = {"a person": "Meal", "restaurant, food stall or food delivery": "Meal", "coffee, tea or juice shop": "Drinks",
+               "petrol station": "Fuel", "car park": "Parking", "something else": "Meal"}
 HISTORY = timedelta(days=365)  # how far back labels, merchants and raw strings are learned from
 SWEEP_EVERY = 900  # seconds between sweeps for taps a webhook missed or failed on
 ASK_EVERY = 96  # sweeps between pings again for unanswered `ask`s: daily
-CLASSIFY, CORRECT, NAMED = re.split(r"\n=== \w+ ===\n", Path(__file__).with_name("prompt.txt").read_text(encoding="utf-8"))
+CLASSIFY, CORRECT, NAMED, GUESS = re.split(r"\n=== \w+ ===\n", Path(__file__).with_name("prompt.txt").read_text(encoding="utf-8"))
 log = logging.getLogger("ai")
 
 
@@ -168,6 +172,16 @@ def usual_name(tx, splits):
     names = Counter(t["description"] for t in splits if t["type"] == tx["type"] and norm(party(t)) == norm(party(tx)))
     name, uses = (names.most_common(1) or [(None, 0)])[0]
     return name if uses >= USUAL_MIN and uses >= 0.8 * sum(names.values()) else None
+
+
+def payee_kind(tx, splits):
+    """The label kind tx's party most often got among past named `ask` splits, else None."""
+    kinds = Counter(kind(t["description"]) for t in splits if t["type"] == tx["type"] and norm(party(t)) == norm(party(tx)))
+    return kinds.most_common(1)[0][0] if kinds else None
+
+
+def by_clock(label, tx):
+    return meal_for(datetime.fromisoformat(tx["date"]).hour) if kind(label) == "Meal" else label
 
 
 def is_own(tx):
@@ -306,6 +320,10 @@ def named_prompt(tx, name, labels):
         raw=parse_raw(tx), labels="\n".join(f"- {n} -> {c}" for n, c in labels.items()) or "(none yet)")
 
 
+def guess_prompt(tx):
+    return Template(GUESS).safe_substitute(payee=party(tx), amount=money(tx), raw=parse_raw(tx), kinds="; ".join(PAYEE_KINDS))
+
+
 def schema(ctx, correction=False):
     props = {"description": {"type": "string"}, "merchant": {"type": "string"},
              "category": {"type": "string", "enum": ctx["categories"]},
@@ -429,7 +447,8 @@ class Bot(discord.Client):
         return [t for g in groups for t in g["attributes"]["transactions"]]
 
     async def ask(self, group_id, tx):
-        """Book a party's usual name unpinged (a reply still corrects it), else ask for one."""
+        """Book a party's usual name unpinged (a reply still corrects it). Else money sent is booked with a guess
+        and pinged to fix, money received is asked for a name."""
         raw = parse_raw(tx)
         try:
             splits = await self.ask_history()
@@ -439,10 +458,25 @@ class Bot(discord.Client):
                 await self.update(group_id, tx["transaction_journal_id"], f)
                 log.info("#%s named from history -> %s", group_id, f)
                 return await self.post(f"🤖 {name} ({f['category_name']}), reply to fix\n" + summary(group_id, tx, None, raw))
+            if tx["type"] == "withdrawal":
+                f = await self.named(tx, await self.guess(tx, splits))
+                await self.update(group_id, tx["transaction_journal_id"], f)
+                log.info("#%s guessed -> %s", group_id, f)
+                return await self.post(f"<@{DISCORD_USER_ID}> 🤔 guessed {f['description']} ({f['category_name'] or '-'}), "
+                                       "reply to fix\n" + summary(group_id, tx, None, raw))
         except Exception:
-            log.exception("usual name for #%s failed, asking instead", group_id)
+            log.exception("naming #%s failed, asking instead", group_id)
         log.info("#%s pinged for a name", group_id)
         await self.post(f"<@{DISCORD_USER_ID}> ✏️ reply with a name, or name / category\n" + summary(group_id, tx, None, raw))
+
+    async def guess(self, tx, splits):
+        """Money sent: what its payee usually got, else what the model takes the payee for; a meal by the hour."""
+        label = payee_kind(tx, splits)
+        if not label:
+            result = await self.ollama(guess_prompt(tx), {"type": "object", "properties": {
+                "payee": {"type": "string", "enum": list(PAYEE_KINDS)}}, "required": ["payee"]})
+            label = PAYEE_KINDS[result["payee"]]
+        return by_clock(label, tx)
 
     async def pair(self, group_id, tx):
         """Own transfer: the sent half (a withdrawal to you) and the received half (a deposit from you) become

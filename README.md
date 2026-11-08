@@ -194,8 +194,11 @@ name.
 ### 6. Money sent (optional)
 
 The same flow for notifications such as "Transfer settled!": filter on that title and post a `withdrawal`
-from your account to the person you paid. Reply to the ping the same way. Money you sent and money you
-received keep separate name → category histories.
+from your account to the person you paid. Instead of waiting for your reply, the service books a guess and pings
+`guessed Dinner (Food), reply to fix`, so you only type when it is wrong. The guess is what that payee most often
+got before, else what the model takes the payee for: a person, restaurant or food stall is a meal named by the
+time, a petrol station Fuel, a car park Parking, a drinks shop Drinks. Reply to fix it the same way. Money you sent
+and money you received keep separate name → category histories.
 
 ```json
 {"error_if_duplicate_hash": false, "apply_rules": true, "transactions": [{

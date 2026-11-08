@@ -208,6 +208,22 @@ def test_usual_name():
     assert bot.usual_name(new, [tx("Allowance", dest="ALEX TAN", tags=["ask"])] * 3) is None  # money sent is separate
 
 
+def test_by_clock():
+    at = lambda h: tx("x", date=f"2026-10-10T{h:02}:00:00+08:00")
+    assert bot.by_clock("Meal", at(8)) == "Breakfast" and bot.by_clock("dinner", at(13)) == "Lunch"
+    assert bot.by_clock("Fuel", at(20)) == "Fuel"
+
+
+def test_payee_kind():
+    sent = lambda name, to="SAFIYA M": tx(name, "Food", dest=to, tags=["ask"])
+    new = sent("SAFIYA M")
+    assert bot.payee_kind(new, [sent("Lunch"), sent("Dinner"), sent("Gift")]) == "Meal"  # meals are one kind
+    assert bot.payee_kind(sent("safiya  m"), [sent("Parking")]) == "Parking"  # banks vary the case
+    assert bot.payee_kind(new, [sent("Parking", "CAR PARK")]) is None  # someone else's history
+    got = {**tx("Refund", type="deposit"), "source_name": "SAFIYA M"}
+    assert bot.payee_kind(new, [got]) is None  # money received is separate
+
+
 def test_is_unanswered():
     assert bot.is_unanswered(tx("ALEX TAN", dest="alex tan", tags=["ask"]))
     got = {**tx("ALEX TAN", dest="My eWallet", tags=["ask"], type="deposit"), "source_name": "ALEX TAN"}
@@ -251,6 +267,29 @@ def test_ask_pings_when_unsure():
     b = Stub()
     asyncio.run(b.ask(9, new))
     assert b.updates == [] and "<@" in b.posts[0] and bot.txn_id(b.posts[0]) == 9
+
+
+def test_ask_guesses_money_sent():
+    sent = lambda name, to, cat="Food": tx(name, cat, dest=to, tags=["ask"], date="2026-10-10T20:00:00+08:00")
+    b = Stub({"has_any_category": [group(1, sent("Lunch", "SAM LEE")), group(2, sent("Dinner", "ALEX TAN"))]})
+    b.ctx, b.ctx_at = ctx(), time.monotonic()
+    asked = []
+
+    async def model(prompt, fmt):
+        asked.append(list(fmt["properties"]))
+        return {"payee": "petrol station"} if "payee" in fmt["properties"] else {"category": "Transport"}
+    b.ollama = model
+    asyncio.run(b.ask(9, sent("SAM LEE", "SAM LEE", None)))  # a friend who got Lunch before, paid at 20:00
+    assert b.updates == [(9, {"description": "Dinner", "category_name": "Food"})] and asked == []
+    assert "<@" in b.posts[0] and "guessed Dinner" in b.posts[0] and bot.txn_id(b.posts[0]) == 9
+    asyncio.run(b.ask(8, sent("SHELL 24", "SHELL 24", None)))  # new payee: the model says what it is
+    assert b.updates[-1] == (8, {"description": "Fuel", "category_name": "Transport"}) and asked == [["payee"], ["category"]]
+
+    async def down(*a):
+        raise RuntimeError("Ollama 500")
+    b.ollama = down
+    asyncio.run(b.ask(7, sent("SHELL 25", "SHELL 25", None)))
+    assert len(b.updates) == 2 and "reply with a name" in b.posts[-1]  # no guess: asked as before
 
 
 def test_ask_pings_when_firefly_fails():
@@ -393,7 +432,8 @@ def test_own_partner():
         assert bot.own_partner(sent, {5: got(source_name="ONG CHUN HAO")}) is None  # money from someone else
         assert bot.own_partner(sent, {5: got(tags=[])}) is None
         assert bot.own_partner(sent, {6: got(date="2026-10-11T14:15:00+08:00"), 5: got()})[0] == 5  # closest wins
-    assert not bot.is_own(sent)  # unset: no pairing
+    with patch.object(bot, "OWNER_NAME", ""):  # not the .ai.env one docker compose loads
+        assert not bot.is_own(sent)  # unset: no pairing
 
 
 def own_halves():
@@ -507,6 +547,8 @@ def test_prompts_fill():
     assert "money received" in p and "from: Main Account" in p
     p = bot.named_prompt(tx("X", dest="ONG CHUN HAO"), "Dinner split", {})
     assert not re.search(r"\$\w", p) and "money sent" in p and "to: ONG CHUN HAO" in p and "received" not in p
+    p = bot.guess_prompt(tx("X", dest="SHELL 24", notes="raw: You've sent $5.00 | card: My Bank"))
+    assert not re.search(r"\$[a-z]", p) and '"SHELL 24"' in p and "car park" in p and "=== " not in bot.NAMED
 
 
 if __name__ == "__main__":
