@@ -21,8 +21,9 @@ def tx(desc, cat=None, bud=None, dest="Shop", tags=(), notes=None, date="2026-10
             "currency_symbol": "€", "transaction_journal_id": "7", "type": type}
 
 
-def tap(desc, dest, raw, day=10, cat="Food"):
-    return tx(desc, cat, cat, dest, tags=["applepay"], notes=f"raw: {raw} | card: My Visa", date=f"2026-10-{day}T12:00:00+00:00")
+def tap(desc, dest, raw, day=10, cat="Food", tags=()):
+    return tx(desc, cat, cat, dest, tags=["applepay", *tags], notes=f"raw: {raw} | card: My Visa",
+              date=f"2026-10-{day}T12:00:00+00:00")
 
 
 def group(id, *splits):
@@ -95,10 +96,11 @@ def test_foreign_paid():
 
 def ctx():
     splits = [
-        tx("Lunch", "Food", "Food", "McDonald’s"),
+        tx("Lunch", "Food", "Food", "McDonald’s", tags=["reviewed"]),  # one reviewed split settles its label
+        # two unreviewed guesses: too few to settle Subway's label
         tx("Lunch", "Food", "Food", "Subway", date="2026-10-09T12:00:00+00:00"),
         tx("Lunch", "Food", None, "Subway", date="2026-10-08T12:00:00+00:00"),
-        tx("Fuel", "Transport", "Transport", "Shell", tags=["applepay"], notes="raw: SHELL 24 | card: My Visa",
+        tx("Fuel", "Transport", "Transport", "Shell", tags=["applepay", "reviewed"], notes="raw: SHELL 24 | card: My Visa",
            date="2026-10-10T18:00:00+00:00"),
         # not yet enriched: raw merchant as description, must not become a label or example
         tx("DOWNTOWN BURGER BAR", dest=bot.PENDING, tags=["applepay"], notes="raw: DOWNTOWN BURGER BAR | card: My Visa",
@@ -114,14 +116,47 @@ def test_build_context():
     c = ctx()
     assert c["label_map"] == {"Lunch": ("Food", "Food"), "Fuel": ("Transport", "Transport")}
     assert c["counts"] == {"Lunch": 3, "Fuel": 1}
-    assert c["merchant_kind"] == {"McDonald’s": "Meal", "Subway": "Meal", "Shell": "Fuel"}
+    assert c["merchant_kind"] == {"McDonald’s": "Meal", "Shell": "Fuel"}
     assert c["budgets"][-1] == bot.NO_BUDGET
     assert bot.PENDING not in c["merchants"]
-    assert not any("DOWNTOWN BURGER" in e for e in c["examples"])
-    assert c["examples"][0] == 'Sat 18:00 €12.50 -> Fuel @ Shell (raw "SHELL 24")'
+    assert not any("DOWNTOWN BURGER" in bot.example(t) for t in c["examples"])
+    assert bot.example(c["examples"][0]) == 'Sat 18:00 €12.50 -> Fuel @ Shell (raw "SHELL 24")'
     # a merchant with mixed history (car park + canteen) has no dominant kind
     mixed = [tx("Parking", dest="City Mall"), tx("Parking", dest="City Mall"), tx("Lunch", dest="City Mall"), tx("Dinner", dest="City Mall")]
     assert "City Mall" not in bot.build_context([], [], [], mixed)["merchant_kind"]
+
+
+def test_merchant_kind():
+    kinds = lambda *splits: bot.build_context([], [], [], list(splits))["merchant_kind"]
+    guess = lambda desc, day=10: tap(desc, "Kiosk", "KIOSK", day)
+    fixed = lambda desc, day=10: tap(desc, "Kiosk", "KIOSK", day, tags=["reviewed"])
+    assert kinds(guess("Drinks")) == {}  # one unreviewed guess must not lock the label
+    assert kinds(guess("Drinks"), guess("Drinks", 11)) == {}
+    assert kinds(guess("Drinks"), guess("Drinks", 11), guess("Drinks", 12)) == {"Kiosk": "Drinks"}
+    assert kinds(fixed("Dessert")) == {"Kiosk": "Dessert"}  # one review is enough
+    # reviews outvote any number of guesses
+    assert kinds(fixed("Dessert"), *[guess("Drinks", d) for d in (11, 12, 13, 14)]) == {"Kiosk": "Dessert"}
+    assert kinds(fixed("Dessert"), fixed("Drinks", 11)) == {}  # reviews disagree: no usual label
+
+
+def test_known_merchant():
+    c = {"raw_merchant": {"mcdonalds main st": "McDonald’s", "0412": "Odd Shop"}}
+    assert bot.known_merchant("McDonalds  MAIN st", c) == "McDonald’s"  # exact (norm)
+    assert bot.known_merchant("MCDONALDS MAIN ST. 0423", c) == "McDonald’s"  # another terminal
+    assert bot.known_merchant("MCDONALDS MAIN STR", c) == "McDonald’s"  # close: 0.97
+    assert bot.known_merchant("MCDONALDS", c) is None  # 0.69, below RAW_CUTOFF
+    assert bot.known_merchant("0412", c) == "Odd Shop"  # all digits: exact only
+    assert bot.known_merchant("0413", c) is None and bot.known_merchant("", c) is None
+
+
+def test_raw_merchant_precedence():
+    guess, fixed = tap("Dessert", "Sweat Scoop", "SS LTD", 12), tap("Dessert", "Sweet Scoop", "SS LTD", 10, tags=["reviewed"])
+    newer = tap("Dessert", "Sweet Scoop Co", "SS LTD", 11, tags=["reviewed"])
+    for splits in ([guess, fixed], [fixed, guess]):  # a review beats a newer guess, in any order
+        assert bot.build_context([], [], [], splits)["raw_merchant"] == {"ss ltd": "Sweet Scoop"}
+    assert bot.build_context([], [], [], [fixed, newer, guess])["raw_merchant"] == {"ss ltd": "Sweet Scoop Co"}
+    # the fuzzy match keeps that order: the reviewed one wins for another terminal too
+    assert bot.known_merchant("SS LTD 02", bot.build_context([], [], [], [guess, fixed])) == "Sweet Scoop"
 
 
 def test_meal_for():
@@ -247,7 +282,7 @@ def test_remembered():
     mixed = [tap("Parking", "City Mall", "CM", 10), tap("Lunch", "City Mall", "CM", 11)]
     assert bot.remembered("CM", bot.build_context([], ["Food"], ["Food"], mixed), 12) is None
     # a meal label this history has never seen has no category yet: the model must supply one
-    meals = [tap("Lunch", "Subway", "SUB", 10)]
+    meals = [tap("Lunch", "Subway", "SUB", 10, tags=["reviewed"])]
     c = bot.build_context([], ["Food"], ["Food"], meals)
     assert bot.remembered("SUB", c, 12)["description"] == "Lunch"
     assert bot.remembered("SUB", c, 20) is None
@@ -517,8 +552,10 @@ def test_reply_routes():
 
     msg, done = owner_reply("it was fuel", bot.summary(6, tapped, None, "MCD 01"))
     asyncio.run(b.on_message(msg))
+    # marked reviewed, its other tags kept: PUT replaces the list
     assert b.updates[-1] == (6, {"description": "Fuel", "destination_name": "McDonald’s", "category_name": "Transport",
-                                 "budget_name": "Transport"}) and done[-1] == "✅"
+                                 "budget_name": "Transport", "tags": ["applepay", "reviewed"]}) and done[-1] == "✅"
+    assert not any("tags" in f for _, f in b.updates[:-1])  # only a tap correction reviews
 
 
 def test_own_ends():
@@ -549,6 +586,165 @@ def test_prompts_fill():
     assert not re.search(r"\$\w", p) and "money sent" in p and "to: ONG CHUN HAO" in p and "received" not in p
     p = bot.guess_prompt(tx("X", dest="SHELL 24", notes="raw: You've sent $5.00 | card: My Bank"))
     assert not re.search(r"\$[a-z]", p) and '"SHELL 24"' in p and "car park" in p and "=== " not in bot.NAMED
+
+
+def test_classify_prompt_narrows():
+    garage = lambda i: tx("Fuel", "Transport", "Transport", f"Garage {i}", tags=["applepay"],
+                          notes=f"raw: GARAGE {i} | card: My Visa", date=f"2026-10-11T{i // 60:02}:{i % 60:02}:00+00:00")
+    old = tap("Dessert", "Sweet Scoop", "SWEET SCOOP LTD", 10)  # the oldest of all
+    splits = [garage(i) for i in range(45)] + [old]
+    c = bot.build_context([t["destination_name"] for t in splits], ["Food", "Transport"], ["Food"], splits)
+    p = bot.classify_prompt(tap("X", bot.PENDING, "SWEET SCOOP LTD 2"), "SWEET SCOOP LTD 2", c)
+    merchants = p.split("Known merchants:\n")[1].split("\n")[0].split(", ")
+    assert len(merchants) == bot.MERCHANTS_SHOWN and "Sweet Scoop" in merchants
+    examples = p.split("label @ merchant):\n")[1].strip().split("\n")
+    assert len(examples) == len(set(examples)) == 30
+    assert examples[0] == bot.example(old)  # the similar one first, though it is the oldest
+    hidden = next(m for m in c["merchants"] if m not in merchants)  # finalize still matches the full list
+    assert bot.finalize(result("Fuel", hidden.upper()), c, 12)[0]["destination_name"] == hidden
+
+
+def test_ollama_warns_near_context_limit():
+    def session(reply):
+        class Response:
+            status = 200
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def json(self): return reply
+        return SimpleNamespace(post=lambda *a, **kw: Response())
+    b = bot.Bot()
+    for count, warned in ((bot.NUM_CTX - 500, True), (bot.NUM_CTX // 2, False), (None, False)):
+        reply = {"message": {"content": '{"ok": 1}'}, **({"prompt_eval_count": count} if count else {})}
+        b.web = session(reply)
+        with patch.object(bot.log, "warning") as warn:
+            assert asyncio.run(b.ollama("p", {})) == {"ok": 1}
+        assert warn.called == warned, count
+
+
+def test_eval_replay():
+    import eval
+    old, mid = tap("Fuel", "Shell", "SHELL 24", 10, "Transport"), tap("Lunch", "Subway", "SUB", 11)
+    new = tap("Fuel", "Shell", "SHELL 24", 12, "Transport")
+    pending = tx("X", dest=bot.PENDING, tags=["applepay"])
+    assert eval.eval_taps([group(3, new), group(1, old), group(2, mid), group(4, pending), group(5, old, mid),
+                           group(6, tx("Dinner split", dest="SAM", tags=["applepay", "ask"]))]) == [old, mid, new]
+    c = eval.replay_ctx(mid, [new, old, mid], ["Transport"], [])
+    assert c["merchants"] == ["Shell"] and c["raw_merchant"] == {"shell 24": "Shell"}  # nothing from mid or later
+    rec = lambda exp, pred, via="model", conf=0.9, reasons=(), error=None: {
+        "raw": "R", "expected_label": exp[0], "expected_merchant": exp[1], "predicted_label": pred[0],
+        "predicted_merchant": pred[1], "via": via, "confidence": conf, "reasons": list(reasons), "error": error}
+    text = eval.report([rec(("Fuel", "Shell"), ("fuel", " shell"), "history", 1),
+                        rec(("Lunch", "Subway"), ("Dinner", "Subway"), conf=0.5, reasons=["low confidence"]),
+                        rec(("Lunch", "Subway"), ("Lunch", "KFC")),
+                        rec(("Lunch", "Subway"), ("Lunch", "Subway"), reasons=["new label"]),
+                        rec(("Lunch", "Subway"), (None, None), via=None, conf=None, error="Ollama 500")])
+    for line in ["taps: 5, errored: 1, scored: 4", "settled by history: 1/4 (25%), model calls: 3/4 (75%)",
+                 "merchant: 3/4 (75%)", "label: 3/4 (75%)", "both: 2/4 (50%)",
+                 "both via history: 1/1 (100%), via model: 1/3 (33%)", "flagged: 2/4 (50%)",
+                 "flag precision (flagged that were wrong): 1/2 (50%)", "flag recall (wrong that were flagged): 1/2 (50%)",
+                 "confidence < 0.7: 1/1 (100%)", "confidence >= 0.7: 1/2 (50%)",
+                 '"R": Lunch @ Subway -> Dinner @ Subway [model] low confidence', '"R": error Ollama 500']:
+        assert line in text, line
+
+
+def test_direct_patch():
+    c = ctx()
+    assert bot.direct_patch(" FUEL ", c) == {"description": "Fuel"}
+    assert bot.direct_patch("subway", c) == {"merchant": "Subway"}
+    assert bot.direct_patch("transport", c) == {"category": "Transport"}  # also a budget: category first
+    assert bot.direct_patch("(none)", c) == {"budget": "(none)"}
+    assert bot.direct_patch("it was fuel", c) is None  # free-form: the model decides
+    c["merchants"] += ["Fuel", "Transport"]
+    assert bot.direct_patch("fuel", c) == {"description": "Fuel"}  # label beats merchant
+    assert bot.direct_patch("transport", c) == {"merchant": "Transport"}  # merchant beats category
+
+
+def test_reply_direct_skips_model():
+    tapped = tx("Lunch", "Food", "Food", "McDonald’s", tags=["applepay"], notes="raw: MCD 01 | card: My Visa")
+    b = Stub(firefly={"/transactions/6": {"data": {"attributes": {"transactions": [tapped]}}}})
+    b.ctx, b.ctx_at = ctx(), time.monotonic()
+
+    async def no_model(*a):
+        raise AssertionError("model called")
+    b.ollama = no_model
+    msg, done = owner_reply("subway", bot.summary(6, tapped, None, "MCD 01"))
+    asyncio.run(b.on_message(msg))
+    assert b.updates == [(6, {"description": "Lunch", "destination_name": "Subway", "category_name": "Food",
+                              "budget_name": "Food", "tags": ["applepay", "reviewed"]})] and done[-1] == "✅"
+
+
+def test_ollama_retries_once():
+    def session(*outcomes):
+        """Each post: an exception to raise, or an HTTP status to answer with."""
+        calls = []
+
+        class Response:
+            def __init__(self, outcome): self.outcome = outcome
+            status = property(lambda self: self.outcome)
+            async def __aenter__(self):
+                if isinstance(self.outcome, Exception):
+                    raise self.outcome
+                return self
+            async def __aexit__(self, *a): pass
+            async def json(self): return {"message": {"content": '{"ok": 1}'}}
+            async def text(self): return "boom"
+
+        def post(*a, **kw):
+            calls.append(1)
+            return Response(outcomes[len(calls) - 1])
+        return SimpleNamespace(post=post), calls
+    b = bot.Bot()
+    b.web, calls = session(asyncio.TimeoutError(), 200)
+    assert asyncio.run(b.ollama("p", {})) == {"ok": 1} and len(calls) == 2
+    for outcomes, error in (((500, 200), RuntimeError), ((asyncio.TimeoutError(), asyncio.TimeoutError()), asyncio.TimeoutError)):
+        b.web, calls = session(*outcomes)
+        try:
+            asyncio.run(b.ollama("p", {}))
+            assert False, "must raise"
+        except error:
+            pass
+        assert len(calls) == (1 if outcomes[0] == 500 else 2)
+
+
+def test_eval_ask_replay():
+    import eval
+    sent = lambda name, to, day, cat="Food": tx(name, cat, dest=to, tags=["ask"], date=f"2026-10-{day}T20:00:00+08:00")
+    paid = lambda name, day: {**tx(name, "Family", dest="My eWallet", tags=["ask"], type="deposit",
+                                   date=f"2026-10-{day}T09:00:00+08:00"), "source_name": "ALEX TAN"}
+    a1, a2, a3, a4 = (paid("Allowance", d) for d in (10, 11, 12, 13))
+    same = paid("Gift", 13)  # same moment as a4: neither sees the other
+    s1, s2 = sent("Parking", "CAR PARK", 10, "Transport"), sent("Lunch", "SHELL 24", 11)
+    pairs = eval.ask_replay([a4, s2, a1, a3, same, a2, s1])
+    assert [t for t, _ in pairs][:4] == [a1, s1, a2, s2]
+    earlier = {id(t): e for t, e in pairs}
+    assert earlier[id(a1)] == [] and earlier[id(s1)] == [a1]
+    assert a4 not in earlier[id(same)] and same not in earlier[id(a4)] and a3 in earlier[id(a4)]  # strictly before
+    b = Stub()
+
+    async def model(prompt, fmt):
+        return {"payee": "petrol station"}
+    b.ollama = model
+    rec = lambda t, before=None: asyncio.run(eval.ask_record(b, t, earlier[id(t)] if before is None else before))
+    usual, asked, guessed = rec(a4), rec(a1), rec(s2)
+    assert (usual["via"], usual["predicted_name"], usual["predicted_category"]) == ("usual", "Allowance", "Family")
+    assert (asked["via"], asked["predicted_name"]) == ("asked", None)  # money received, no usual name
+    assert (guessed["via"], guessed["predicted_name"], guessed["predicted_category"]) == ("model", "Fuel", None)
+    known = rec(sent("Lunch", "car park", 12), [s1])
+    assert (known["via"], known["predicted_name"]) == ("payee history", "Parking")
+
+    async def down(*a):
+        raise RuntimeError("Ollama 500")
+    b.ollama = down
+    failed = rec(s2)  # recorded, not raised
+    assert failed["error"] == "Ollama 500"
+    text = eval.ask_report([usual, {**usual, "expected_category": "Gifts"}, asked, guessed, known, failed])
+    for line in ["splits: 6, errored: 1", "via: usual 2, payee history 1, model 1, asked 1", "name: 2/4 (50%)",
+                 "name via usual: 2/2 (100%), via payee history: 0/1 (0%), via model: 0/1 (0%)",
+                 "category via usual: 1/2 (50%)", "would have asked: 1/5 (20%)",
+                 "  Lunch -> Fuel [model] withdrawal", "  Lunch -> Parking [payee history] withdrawal",
+                 "  Allowance -> Allowance [usual] deposit, category Gifts -> Family", "  error Ollama 500 withdrawal"]:
+        assert line in text, line
+    assert "ALEX" not in text and "SHELL" not in text and "CAR PARK" not in text  # no party names
 
 
 if __name__ == "__main__":
