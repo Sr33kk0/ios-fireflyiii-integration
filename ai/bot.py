@@ -8,6 +8,7 @@ An `ask` sent to or received from OWNER_NAME is half of an own transfer: the two
 transfer. A half left alone is pinged, and the reply names the account that replaces OWNER_NAME. See README.md.
 """
 import asyncio
+import difflib
 import hashlib
 import hmac
 import json
@@ -41,11 +42,15 @@ OWNER_NAME = env("OWNER_NAME", "")  # your name as banks print it: money sent to
 TAG = "applepay"
 PENDING = "Apple Pay pending"  # placeholder expense account the Shortcut books to
 ASK = "ask"  # tag: ping on Discord, the reply is the description (e.g. eWallet money received, bank transfer sent)
+REVIEWED = "reviewed"  # tag: the owner's reply corrected this tap; its label and merchant outrank model guesses
 NO_BUDGET = "(none)"
 CACHE_SECONDS = 3600
 PAIR_WINDOW = timedelta(minutes=2)  # max gap between the sent and received notification of one own transfer
 PAIR_WAIT = 150  # seconds a half waits for its other half before it is pinged: PAIR_WINDOW + slack for its webhook
-USUAL_MIN = 3  # uses of one name before a party gets it without asking
+USUAL_MIN = 3  # uses of one name before a party gets it without asking (or a merchant its label, unreviewed)
+RAW_CUTOFF = 0.85  # tuning knob: how alike two raw strings (digits, punctuation dropped) must be to be one shop
+MERCHANTS_SHOWN = 40  # merchants in the classify prompt: the ones most like the raw string
+NUM_CTX = 8192  # Ollama context tokens; Ollama cuts a longer prompt silently, so ollama() warns near it
 # what the model may take a payee for -> the label guessed for money sent to it (Meal: by the hour). On 24 past
 # payments, payee history then this got 20 right; the 4 misses were one-offs (a gift, a movie ticket).
 PAYEE_KINDS = {"a person": "Meal", "restaurant, food stall or food delivery": "Meal", "coffee, tea or juice shop": "Drinks",
@@ -81,6 +86,26 @@ def match_name(name, names):
 def parse_raw(tx):
     m = re.search(r"raw:\s*(.*?)\s*\|\s*card:", tx.get("notes") or "")  # Shortcuts pads variables unevenly
     return m.group(1) if m else tx["description"]
+
+
+def raw_key(raw):
+    """A raw string without digits, punctuation or extra spaces: "MCD MAIN ST. 0423" -> "mcd main st"."""
+    return " ".join(re.sub(r"[\W\d_]+", " ", norm(raw)).split())
+
+
+def known_merchant(raw, ctx):
+    """The merchant history books `raw` to, else None: the same raw string, else the same without digits and
+    punctuation (another branch or terminal), else the closest such one (>= RAW_CUTOFF)."""
+    known = ctx["raw_merchant"]  # best first: reviewed, then newest
+    if norm(raw) in known:
+        return known[norm(raw)]
+    keys = {}
+    for r, m in known.items():
+        keys.setdefault(raw_key(r), m)
+    keys.pop("", None)  # all digits/punctuation: nothing to compare
+    key = raw_key(raw)
+    hit = ([key] if key in keys else difflib.get_close_matches(key, keys, n=1, cutoff=RAW_CUTOFF)) if key else []
+    return keys[hit[0]] if hit else None
 
 
 def foreign_paid(tx):
@@ -129,20 +154,32 @@ def kind(label):
     return "Meal" if norm(label) in ("meal", "breakfast", "lunch", "dinner") else label
 
 
+def dominant(votes, least=USUAL_MIN):
+    """The most common key of Counter `votes` if it has >= 80% of them and >= `least` uses, else None."""
+    top, n = (votes.most_common(1) or [(None, 0)])[0]
+    return top if n >= least and n >= 0.8 * sum(votes.values()) else None
+
+
 def build_context(merchants, categories, budgets, splits):
     """History -> label map (most common category/budget per description), each merchant's dominant
-    label kind (>= 80% of its transactions), counts, few-shot examples."""
+    label kind, counts, examples (newest first), raw string -> merchant."""
+    tags = lambda t: t.get("tags") or []
     # a tap still on PENDING has no merchant to teach; `ask`: own flow
-    done = [t for t in splits if t["destination_name"] != PENDING and ASK not in (t.get("tags") or [])]
-    combos, by_merchant = defaultdict(Counter), defaultdict(Counter)
+    done = [t for t in splits if t["destination_name"] != PENDING and ASK not in tags(t)]
+    combos, by_merchant, reviewed = defaultdict(Counter), defaultdict(Counter), defaultdict(Counter)
     for t in done:
         combos[t["description"]][(t.get("category_name"), t.get("budget_name"))] += 1
         by_merchant[t["destination_name"]][kind(t["description"])] += 1
-    merchant_kind = {m: c.most_common(1)[0][0] for m, c in by_merchant.items()
-                     if c.most_common(1)[0][1] >= 0.8 * sum(c.values())}
+        if REVIEWED in tags(t):
+            reviewed[t["destination_name"]][kind(t["description"])] += 1
+    # the owner's reviews alone decide, one is enough; else USUAL_MIN guesses must agree, so one can't lock a label
+    merchant_kind = {m: k for m, c in by_merchant.items()
+                     if (k := dominant(reviewed[m], 1) if reviewed[m] else dominant(c))}
     recent = sorted(done, key=lambda t: t["date"], reverse=True)
-    examples = [f"{when(t)} {money(t)} -> {t['description']} @ {t['destination_name']}"
-                + (f' (raw "{parse_raw(t)}")' if TAG in (t.get("tags") or []) else "") for t in recent[:30]]
+    raw_merchant = {}  # best first: a reviewed tap beats a guess whatever its date, then the newest wins
+    for t in sorted(recent, key=lambda t: REVIEWED not in tags(t)):  # stable: newest first within each
+        if TAG in tags(t):
+            raw_merchant.setdefault(norm(parse_raw(t)), t["destination_name"])
     return {
         "merchants": [m for m in merchants if m != PENDING],
         "categories": categories,
@@ -151,9 +188,8 @@ def build_context(merchants, categories, budgets, splits):
         "counts": {label: sum(c.values()) for label, c in combos.items()},
         "merchant_kind": merchant_kind,
         "seen": set(by_merchant),  # merchants with withdrawal history
-        "examples": examples,
-        # oldest first so the newest wins: a corrected tap replaces the model's first guess
-        "raw_merchant": {norm(parse_raw(t)): t["destination_name"] for t in reversed(recent) if TAG in (t.get("tags") or [])},
+        "examples": recent,
+        "raw_merchant": raw_merchant,
     }
 
 
@@ -169,9 +205,8 @@ def named_labels(splits, tx_type):
 
 def usual_name(tx, splits):
     """The name tx's party nearly always gets among past named `ask` splits (>= USUAL_MIN uses, >= 80%), else None."""
-    names = Counter(t["description"] for t in splits if t["type"] == tx["type"] and norm(party(t)) == norm(party(tx)))
-    name, uses = (names.most_common(1) or [(None, 0)])[0]
-    return name if uses >= USUAL_MIN and uses >= 0.8 * sum(names.values()) else None
+    return dominant(Counter(t["description"] for t in splits
+                            if t["type"] == tx["type"] and norm(party(t)) == norm(party(tx))))
 
 
 def payee_kind(tx, splits):
@@ -252,7 +287,7 @@ def finalize(result, ctx, hour):
 
 def remembered(raw, ctx, hour):
     """Firefly fields for a raw string history already settles, else None: the model is needed."""
-    merchant = ctx["raw_merchant"].get(norm(raw))
+    merchant = known_merchant(raw, ctx)
     label = ctx["merchant_kind"].get(merchant)
     if not label:
         return None
@@ -278,6 +313,17 @@ def apply_correction(tx, patch, ctx):
     return fields(label, merchant, category, budget)
 
 
+def direct_patch(reply, ctx):
+    """A reply that is just one known label, merchant, category or budget (first match wins) -> its patch, else
+    None: the model is needed."""
+    for key, names in (("description", ctx["label_map"]), ("merchant", ctx["merchants"]),
+                       ("category", ctx["categories"]), ("budget", ctx["budgets"])):
+        hit = match_name(reply, names)
+        if hit:
+            return {key: hit}
+    return None
+
+
 def summary(group_id, tx, f, raw):
     lines = [f"{money(tx)} · {when(tx)} · {tx['source_name']}"]
     if f:
@@ -297,12 +343,31 @@ def labels_text(ctx):
                      f"({ctx['counts'][l]}x)" for l in top) or "(none yet)"
 
 
+def example(t):
+    return (f"{when(t)} {money(t)} -> {t['description']} @ {t['destination_name']}"
+            + (f' (raw "{parse_raw(t)}")' if TAG in (t.get("tags") or []) else ""))
+
+
 def classify_prompt(tx, raw, ctx):
+    """Only the history like this raw string: MERCHANTS_SHOWN merchants, 10 similar examples + the newest, 30 lines.
+    finalize still matches the model's merchant against them all."""
+    key = raw_key(raw)
+    sim = lambda s: difflib.SequenceMatcher(None, key, raw_key(s)).ratio() if key else 0
+    # ponytail: O(history) ratios per tap, fine for a year of taps; index raw keys by word if it gets slow
+    merchants = ctx["merchants"]
+    if len(merchants) > MERCHANTS_SHOWN:
+        booked = defaultdict(list)
+        for r, m in ctx["raw_merchant"].items():
+            booked[m].append(r)
+        merchants = sorted(merchants, key=lambda m: max(map(sim, [m, *booked[m]])), reverse=True)[:MERCHANTS_SHOWN]
+    taps = [t for t in ctx["examples"] if TAG in (t.get("tags") or [])]
+    similar = [t for t in sorted(taps, key=lambda t: sim(parse_raw(t)), reverse=True)[:10] if sim(parse_raw(t)) > 0]
+    shown = similar + [t for t in ctx["examples"] if t not in similar][:30 - len(similar)]
     return Template(CLASSIFY).safe_substitute(
         locale=f" in {LOCALE}" if LOCALE else "",
         raw=raw, amount=money(tx), when=when(tx, "%A %H:%M"), account=tx["source_name"],
-        labels=labels_text(ctx), merchants=", ".join(sorted(ctx["merchants"])),
-        examples="\n".join(ctx["examples"]) or "(none yet)")
+        labels=labels_text(ctx), merchants=", ".join(sorted(merchants)),
+        examples="\n".join(map(example, shown)) or "(none yet)")
 
 
 def correct_prompt(tx, raw, reply, ctx):
@@ -388,12 +453,15 @@ class Bot(discord.Client):
         categories = names(await self.ff_all("/categories", {}))
         budgets = names([b for b in await self.ff_all("/budgets", {}) if b["attributes"].get("active", True)])
         # ponytail: refetched after every update; a merchant unused for HISTORY counts as new. Patch ctx in place if slow
-        today = date.today()
-        groups = await self.ff_all("/transactions", {"type": "withdrawal", "start": (today - HISTORY).isoformat(),
-                                                     "end": (today + timedelta(days=1)).isoformat()})
-        splits = [t for g in groups for t in g["attributes"]["transactions"]]
+        splits = [t for g in await self.withdrawals() for t in g["attributes"]["transactions"]]
         self.ctx, self.ctx_at = build_context(merchants, categories, budgets, splits), time.monotonic()
         return self.ctx
+
+    async def withdrawals(self):
+        """Withdrawal groups of the last HISTORY."""
+        today = date.today()
+        return await self.ff_all("/transactions", {"type": "withdrawal", "start": (today - HISTORY).isoformat(),
+                                                   "end": (today + timedelta(days=1)).isoformat()})
 
     async def update(self, group_id, journal_id, f):
         await self.ff("PUT", f"/transactions/{group_id}", json={
@@ -405,11 +473,24 @@ class Bot(discord.Client):
 
     async def ollama(self, prompt, fmt):
         body = {"model": OLLAMA_MODEL, "messages": [{"role": "user", "content": prompt}], "stream": False,
-                "think": False, "format": fmt, "keep_alive": "30m", "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 300}}
-        async with self.web.post(f"{OLLAMA_URL}/api/chat", json=body, timeout=aiohttp.ClientTimeout(total=60)) as r:
-            if r.status >= 400:
-                raise RuntimeError(f"Ollama {r.status}: {(await r.text())[:300]}")
-            return json.loads((await r.json())["message"]["content"])
+                "think": False, "format": fmt, "keep_alive": "30m", "options": {"temperature": 0, "num_ctx": NUM_CTX, "num_predict": 300}}
+        for retry in (True, False):
+            try:
+                async with self.web.post(f"{OLLAMA_URL}/api/chat", json=body, timeout=aiohttp.ClientTimeout(total=60)) as r:
+                    if r.status >= 400:
+                        raise RuntimeError(f"Ollama {r.status}: {(await r.text())[:300]}")
+                    d = await r.json()
+                break
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                # a cold model can outlast the timeout; Ollama keeps loading it, so the retry meets it warm
+                # ponytail: one retry, so a load + answer over 2 min still fails; add backoff if that shows up in logs
+                if not retry:
+                    raise
+                log.warning("Ollama %s, retrying once", type(e).__name__)
+        if (d.get("prompt_eval_count") or 0) >= 0.9 * NUM_CTX:
+            log.warning("prompt took %s of %d context tokens: it is or soon will be cut off, raise NUM_CTX",
+                        d["prompt_eval_count"], NUM_CTX)
+        return json.loads(d["message"]["content"])
 
     # --- Discord ---
 
@@ -529,17 +610,22 @@ class Bot(discord.Client):
         self.merged |= set(group_ids)
         log.info("%s -> transfer %s to %s", " + ".join(f"#{g}" for g in group_ids), source[1], destination[1])
 
+    async def label(self, tx, raw, ctx):
+        """One tap -> (Firefly fields, flag reasons, confidence, model called). enrich and eval.py share it."""
+        hour = datetime.fromisoformat(tx["date"]).hour
+        f = remembered(raw, ctx, hour)
+        if f:
+            return f, [], 1, False
+        result = await self.ollama(classify_prompt(tx, raw, ctx), schema(ctx))
+        result["merchant"] = known_merchant(raw, ctx) or result["merchant"]  # history beats the model
+        f, reasons = finalize(result, ctx, hour)
+        return f, reasons, confidence(result), True
+
     async def enrich(self, group_id, tx, loud=True):
         """Label one tap. loud=False (a sweep retrying it): a failure is only logged, the next sweep tries again."""
-        raw, hour = parse_raw(tx), datetime.fromisoformat(tx["date"]).hour
+        raw = parse_raw(tx)
         try:
-            ctx = await self.context()
-            f, reasons, conf = remembered(raw, ctx, hour), [], 1
-            if not f:
-                result = await self.ollama(classify_prompt(tx, raw, ctx), schema(ctx))
-                result["merchant"] = ctx["raw_merchant"].get(norm(raw), result["merchant"])  # history beats the model
-                f, reasons = finalize(result, ctx, hour)
-                conf = confidence(result)
+            f, reasons, conf, _ = await self.label(tx, raw, await self.context())
         except Exception as e:
             log.exception("classify #%s failed", group_id)
             if loud:
@@ -635,9 +721,12 @@ class Bot(discord.Client):
                 await msg.add_reaction("✅")
                 return log.info("#%s named by reply %r -> %s", group_id, msg.content, f)
             raw, ctx = parse_raw(tx), await self.context()
-            patch = await self.ollama(correct_prompt(tx, raw, msg.content, ctx), schema(ctx, correction=True))
+            patch = direct_patch(msg.content, ctx) or await self.ollama(
+                correct_prompt(tx, raw, msg.content, ctx), schema(ctx, correction=True))
             f = apply_correction(tx, patch, ctx)
-            await self.update(group_id, tx["transaction_journal_id"], f)
+            # PUT replaces the tag list: keep the tap's tags, mark it reviewed so history trusts it over guesses
+            tags = list(dict.fromkeys([*(tx.get("tags") or []), REVIEWED]))
+            await self.update(group_id, tx["transaction_journal_id"], {**f, "tags": tags})
             await target.edit(content="✅ fixed\n" + summary(group_id, tx, f, raw))
             await msg.add_reaction("✅")
             log.info("#%s corrected by reply %r -> %s", group_id, msg.content, f)

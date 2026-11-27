@@ -12,12 +12,17 @@ with category and budget set, where the bank only gave you `MCDONALDS MAIN STREE
 
 - **Local AI.** Merchant names and amounts go to your own Ollama model, not a cloud API.
 - **Learns from your history.** Labels, categories and budgets come from your last 12 months of Firefly
-  transactions. A raw merchant string seen before keeps its merchant, even after you corrected it, and skips the
-  model when that merchant has a usual label.
+  transactions. A raw merchant string seen before (or nearly: another branch or terminal) keeps its merchant,
+  and skips the model when that merchant has a usual label: one you set by replying (tagged `reviewed`), or 3+
+  agreeing taps. Your corrections outrank the model's guesses. The prompt shows only the 40 merchants and 30
+  past taps most like the new one, so it stays small as history grows.
 - **Asks only when needed.** You get a Discord ping for a new merchant, a new label, an unknown category,
   low model confidence, or a tap in another currency. Everything else is booked silently.
 - **Fix by replying.** Reply to a ping in plain words (`dessert`, `drinks at Starbucks`,
-  `merchant Sweet Scoop, budget (none)`) and the transaction is corrected.
+  `merchant Sweet Scoop, budget (none)`) and the transaction is corrected. A reply that is just one known
+  label, merchant, category or budget (checked in that order) is applied directly, without the model.
+- **Survives a cold model.** A model call that times out or can't connect is retried once: Ollama keeps loading
+  the model meanwhile, so the retry usually meets it warm.
 - **Meals by the clock.** Restaurants become Breakfast, Lunch or Dinner from the time of the tap.
 - **Catches up.** Every 15 minutes it re-checks Apple Pay taps from the last 7 days that are still unlabelled,
   so a tap that came in while the service, Firefly or Ollama was down still gets labelled. On startup and once
@@ -41,6 +46,7 @@ with category and budget set, where the bank only gave you `MCDONALDS MAIN STREE
 | `ai/bot.py` | Webhook receiver, Ollama classifier, Discord bot |
 | `ai/prompt.txt` | Classification and correction prompts (edit to fit your spending) |
 | `ai/test_bot.py` | Plain-assert checks for the logic and flows |
+| `ai/eval.py` | Read-only replay eval of labelling accuracy against past taps |
 | `assets/flow.html` | Source of the flow diagram above (`assets/flow.png` is its export) |
 
 ## Setup
@@ -241,6 +247,19 @@ Rebuild after changes: `docker compose up -d --build ai`.
 ```sh
 docker compose run --rm --no-deps ai python test_bot.py
 ```
+
+## Eval
+
+Replays the past year's labelled taps: each is relabelled with only the history before it, then scored against
+what was booked (accuracy by history vs model, flag precision/recall, error rate by confidence, misses). Read-only.
+
+```sh
+docker compose run --rm ai python eval.py [--ask] [--limit N] [--json records.json]
+```
+
+`--ask` replays named money sent/received (`ask`) instead: each is renamed as the service would have with only the
+earlier ones (usual name, else for money sent a guess from payee history or the model, else it would ask), then
+scored on name, and on category where a usual name gave one. It prints labels only, never who you paid.
 
 ## Limitations
 
